@@ -51,26 +51,26 @@ struct GCommand doc_mot_dong(char *dong) {
     int g_num;
 
     /* Tìm G */
-    p = strstr(dong, "G");
+    p = strchr(dong, 'G');
     if (!p) return cmd;  /* không có G → bỏ qua */
     sscanf(p, "G%d", &g_num);
     if (g_num < 0 || g_num > 3) return cmd;  /* chỉ xử lý G0-G3 */
     snprintf(cmd.code, 4, "G%d", g_num);
 
     /* Tìm X, Y, I, J, F */
-    p = strstr(dong, "X");
+    p = strchr(dong, 'X');
     if (p) { sscanf(p, "X%f", &cmd.x); cmd.has_x = 1; }
 
-    p = strstr(dong, "Y");
+    p = strchr(dong, 'Y');
     if (p) { sscanf(p, "Y%f", &cmd.y); cmd.has_y = 1; }
 
-    p = strstr(dong, "I");
+    p = strchr(dong, 'I');
     if (p) { sscanf(p, "I%f", &cmd.i); cmd.has_i = 1; }
 
-    p = strstr(dong, "J");
+    p = strchr(dong, 'J');
     if (p) { sscanf(p, "J%f", &cmd.j); cmd.has_j = 1; }
 
-    p = strstr(dong, "F");
+    p = strchr(dong, 'F');
     if (p) { sscanf(p, "F%f", &cmd.f); cmd.has_f = 1; }
 
     return cmd;
