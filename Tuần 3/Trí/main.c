@@ -10,28 +10,27 @@
 
 /* ═══════════════════════════════════════
    1. STRUCT + UNION
-   ═══════════════════════════════════════
 
    Tại sao dùng union?
    - G0/G1 (đường thẳng): chỉ cần x, y, z, f
    - G2/G3 (cung tròn): cần thêm i, j (offset đến tâm)
    - Union cho 2 loại lệnh dùng chung 1 vùng nhớ,
      tránh lãng phí khi G0/G1 không dùng i, j.
-*/
+   ═══════════════════════════════════════ */
 
 /* Lệnh đường thẳng: G0, G1 */
 struct LinearCmd {
-    float x, y, z;        /* tọa độ đích */
-    float f;              /* feedrate mm/phút */
+    float x, y, z;        /* tọa độ đích (mm) */
+    float f;              /* feedrate (mm/phút) */
     int   has_x, has_y;   /* cờ: có X/Y trong dòng G-code không */
     int   has_f;          /* cờ: có F trong dòng G-code không */
 };
 
 /* Lệnh cung tròn: G2 (CW), G3 (CCW) */
 struct ArcCmd {
-    float x, y, z;              /* tọa độ đích */
-    float f;                    /* feedrate mm/phút */
-    float i, j;                 /* offset từ điểm đầu đến tâm vòng tròn */
+    float x, y, z;        /* tọa độ đích (mm) */
+    float f;              /* feedrate (mm/phút) */
+    float i, j;           /* offset từ điểm đầu đến tâm vòng tròn (mm) */
     int   has_x, has_y;
     int   has_i, has_j;
     int   has_f;
@@ -47,9 +46,11 @@ struct GCommand {
 };
 
 /* ═══════════════════════════════════════
-   2. HÀM IN 1 LỆNH
+   2. print_command
+   Input:  cmd — con trỏ đến GCommand cần in
+   Output: in ra terminal dạng [G1] X=... Y=... F=...
    ═══════════════════════════════════════ */
-void in_lenh(struct GCommand *cmd) {
+void print_command(struct GCommand *cmd) {
     int is_arc = (cmd->code[1] == '2' || cmd->code[1] == '3');
 
     printf("[%s]", cmd->code);
@@ -70,19 +71,21 @@ void in_lenh(struct GCommand *cmd) {
 }
 
 /* ═══════════════════════════════════════
-   3. HÀM ĐỌC 1 DÒNG GCODE
+   3. parse_line
+   Input:  line — 1 dòng text từ file G-code (vd: "G1 X20 Y0 F800")
+   Output: GCommand chứa loại lệnh và các tham số đã parse
+           Nếu dòng không hợp lệ → trả về GCommand với code[0] = '\0'
    ═══════════════════════════════════════ */
-struct GCommand doc_mot_dong(char *dong) {
+struct GCommand parse_line(char *line) {
     struct GCommand cmd;
     int is_arc;
     char *p;
     int g_num;
 
-    /* khởi tạo toàn bộ vùng data = 0 */
     memset(&cmd, 0, sizeof(cmd));
 
     /* Tìm G — dùng strchr() vì tìm 1 ký tự đơn */
-    p = strchr(dong, 'G');
+    p = strchr(line, 'G');
     if (!p) return cmd;
     sscanf(p, "G%d", &g_num);
     if (g_num < 0 || g_num > 3) return cmd;
@@ -91,30 +94,28 @@ struct GCommand doc_mot_dong(char *dong) {
     is_arc = (g_num == 2 || g_num == 3);
 
     if (is_arc) {
-        /* G2/G3: đọc vào data.arc */
-        p = strchr(dong, 'X');
+        p = strchr(line, 'X');
         if (p) { sscanf(p, "X%f", &cmd.data.arc.x); cmd.data.arc.has_x = 1; }
 
-        p = strchr(dong, 'Y');
+        p = strchr(line, 'Y');
         if (p) { sscanf(p, "Y%f", &cmd.data.arc.y); cmd.data.arc.has_y = 1; }
 
-        p = strchr(dong, 'I');
+        p = strchr(line, 'I');
         if (p) { sscanf(p, "I%f", &cmd.data.arc.i); cmd.data.arc.has_i = 1; }
 
-        p = strchr(dong, 'J');
+        p = strchr(line, 'J');
         if (p) { sscanf(p, "J%f", &cmd.data.arc.j); cmd.data.arc.has_j = 1; }
 
-        p = strchr(dong, 'F');
+        p = strchr(line, 'F');
         if (p) { sscanf(p, "F%f", &cmd.data.arc.f); cmd.data.arc.has_f = 1; }
     } else {
-        /* G0/G1: đọc vào data.linear */
-        p = strchr(dong, 'X');
+        p = strchr(line, 'X');
         if (p) { sscanf(p, "X%f", &cmd.data.linear.x); cmd.data.linear.has_x = 1; }
 
-        p = strchr(dong, 'Y');
+        p = strchr(line, 'Y');
         if (p) { sscanf(p, "Y%f", &cmd.data.linear.y); cmd.data.linear.has_y = 1; }
 
-        p = strchr(dong, 'F');
+        p = strchr(line, 'F');
         if (p) { sscanf(p, "F%f", &cmd.data.linear.f); cmd.data.linear.has_f = 1; }
     }
 
@@ -122,134 +123,145 @@ struct GCommand doc_mot_dong(char *dong) {
 }
 
 /* ═══════════════════════════════════════
-   4. HÀM ĐỌC FILE GCODE
+   4. read_gcode_file
+   Input:  filepath  — đường dẫn file G-code
+           commands  — mảng để lưu các lệnh đọc được
+           max_cmd   — giới hạn số lệnh tối đa
+   Output: số lệnh đọc được (0 nếu không mở được file)
    ═══════════════════════════════════════ */
-int doc_file(const char *ten_file,
-             struct GCommand *commands,
-             int max_lenh) {
-    /*
-     * Trả về: số lệnh đọc được
-     * commands: mảng để lưu kết quả
-     * max_lenh: tối đa bao nhiêu lệnh
-     */
-
-    FILE *f = fopen(ten_file, "r");
+int read_gcode_file(const char *filepath,
+                    struct GCommand *commands,
+                    int max_cmd) {
+    FILE *f = fopen(filepath, "r");
     if (!f) {
-        printf("Loi: Khong mo duoc file %s\n", ten_file);
+        printf("Loi: Khong mo duoc file %s\n", filepath);
         return 0;
     }
 
-    char dong[256];
-    int  so_lenh = 0;
+    char line[256];
+    int  cmd_count = 0;
 
-    while (fgets(dong, 256, f)) {
-        if (dong[0] == ';') continue;   /* bỏ qua dòng comment */
-        if (dong[0] == '\n') continue;  /* bỏ qua dòng trống */
+    while (fgets(line, 256, f)) {
+        if (line[0] == ';') continue;   /* bỏ qua dòng comment */
+        if (line[0] == '\n') continue;  /* bỏ qua dòng trống */
 
-        struct GCommand cmd = doc_mot_dong(dong);
+        struct GCommand cmd = parse_line(line);
         if (cmd.code[0] == '\0') continue;
 
-        commands[so_lenh] = cmd;
-        so_lenh++;
-        if (so_lenh >= max_lenh) break;
+        commands[cmd_count] = cmd;
+        cmd_count++;
+        if (cmd_count >= max_cmd) break;
     }
 
     fclose(f);
-    return so_lenh;
+    return cmd_count;
 }
 
 /* ═══════════════════════════════════════
-   5. HÀM TÍNH QUỸ ĐẠO G1 (đường thẳng)
+   5. interpolate_linear
+   Nội suy tuyến tính từ điểm đầu đến điểm đích, in tọa độ mỗi 100ms.
+   Input:  x0, y0     — tọa độ điểm đầu (mm)
+           x1, y1     — tọa độ điểm đích (mm)
+           feedrate   — tốc độ di chuyển (mm/phút)
+           t_start_ms — thời điểm bắt đầu lệnh (ms)
+   Output: in ra terminal tọa độ X, Y tại từng mốc thời gian
    ═══════════════════════════════════════ */
-void tinh_g1(float x0, float y0,   /* điểm đầu */
-             float x1, float y1,   /* điểm đích */
-             float feedrate,        /* tốc độ mm/phút */
-             float t_bat_dau) {     /* đồng hồ bắt đầu (ms) */
-
-    float dx   = x1 - x0;
-    float dy   = y1 - y0;
-    float dist = sqrt(dx*dx + dy*dy);
+void interpolate_linear(float x0, float y0,
+                        float x1, float y1,
+                        float feedrate,
+                        float t_start_ms) {
+    float dx       = x1 - x0;
+    float dy       = y1 - y0;
+    float dist     = sqrt(dx*dx + dy*dy);
 
     if (dist < 0.001f) return;
 
-    float toc_do  = feedrate / 60.0f / 1000.0f;  /* mm/ms */
-    float tong_ms = dist / toc_do;
+    float speed    = feedrate / 60.0f / 1000.0f;  /* mm/ms */
+    float total_ms = dist / speed;
 
     int t;
-    for (t = 0; t <= (int)tong_ms; t += 100) {
-        float alpha = (float)t / tong_ms;
+    for (t = 0; t <= (int)total_ms; t += 100) {
+        float alpha = (float)t / total_ms;
         float x = x0 + alpha * dx;
         float y = y0 + alpha * dy;
-        printf("  t=%7.1f ms   X=%7.2f   Y=%7.2f\n", t_bat_dau + t, x, y);
+        printf("  t=%7.1f ms   X=%7.2f   Y=%7.2f\n", t_start_ms + t, x, y);
     }
 
     printf("  t=%7.1f ms   X=%7.2f   Y=%7.2f  <- dich\n",
-           t_bat_dau + tong_ms, x1, y1);
+           t_start_ms + total_ms, x1, y1);
 }
 
 /* ═══════════════════════════════════════
-   6. HÀM TÍNH QUỸ ĐẠO G2/G3 (cung tròn)
+   6. interpolate_arc
+   Nội suy cung tròn từ điểm đầu đến điểm đích, in tọa độ mỗi 100ms.
+   Input:  x0, y0     — tọa độ điểm đầu (mm)
+           x1, y1     — tọa độ điểm đích (mm)
+           i_off      — offset X từ điểm đầu đến tâm vòng tròn (mm)
+           j_off      — offset Y từ điểm đầu đến tâm vòng tròn (mm)
+           clockwise  — hướng quay: 1=G2 chiều kim đồng hồ, 0=G3 ngược chiều
+           feedrate   — tốc độ di chuyển (mm/phút)
+           t_start_ms — thời điểm bắt đầu lệnh (ms)
+   Output: in ra terminal tọa độ X, Y tại từng mốc thời gian
    ═══════════════════════════════════════ */
-void tinh_g2g3(float x0, float y0,
-               float x1, float y1,
-               float i_off, float j_off,  /* offset đến tâm */
-               int clockwise,             /* 1=G2 CW, 0=G3 CCW */
-               float feedrate,
-               float t_bat_dau) {
-
-    float tam_x = x0 + i_off;
-    float tam_y = y0 + j_off;
+void interpolate_arc(float x0, float y0,
+                     float x1, float y1,
+                     float i_off, float j_off,
+                     int clockwise,
+                     float feedrate,
+                     float t_start_ms) {
+    float center_x = x0 + i_off;
+    float center_y = y0 + j_off;
 
     float R = sqrt(i_off*i_off + j_off*j_off);
     if (R < 0.001f) return;
 
-    float goc_dau  = atan2(y0 - tam_y, x0 - tam_x);
-    float goc_cuoi = atan2(y1 - tam_y, x1 - tam_x);
+    float angle_start = atan2(y0 - center_y, x0 - center_x);
+    float angle_end   = atan2(y1 - center_y, x1 - center_x);
 
-    float quet;
+    float sweep;
     if (clockwise) {
-        quet = goc_cuoi - goc_dau;
-        if (quet > 0) quet -= 2.0f * 3.14159f;
+        sweep = angle_end - angle_start;
+        if (sweep > 0) sweep -= 2.0f * 3.14159f;
     } else {
-        quet = goc_cuoi - goc_dau;
-        if (quet < 0) quet += 2.0f * 3.14159f;
+        sweep = angle_end - angle_start;
+        if (sweep < 0) sweep += 2.0f * 3.14159f;
     }
 
-    float arc_length = fabs(quet) * R;
-    float toc_do     = feedrate / 60.0f / 1000.0f;
-    float tong_ms    = arc_length / toc_do;
+    float arc_length = fabs(sweep) * R;
+    float speed      = feedrate / 60.0f / 1000.0f;
+    float total_ms   = arc_length / speed;
 
     int t;
-    for (t = 0; t <= (int)tong_ms; t += 100) {
-        float alpha = (float)t / tong_ms;
-        float goc   = goc_dau + alpha * quet;
-        float x     = tam_x + R * cos(goc);
-        float y     = tam_y + R * sin(goc);
-        printf("  t=%7.1f ms   X=%7.2f   Y=%7.2f\n", t_bat_dau + t, x, y);
+    for (t = 0; t <= (int)total_ms; t += 100) {
+        float alpha = (float)t / total_ms;
+        float angle = angle_start + alpha * sweep;
+        float x     = center_x + R * cos(angle);
+        float y     = center_y + R * sin(angle);
+        printf("  t=%7.1f ms   X=%7.2f   Y=%7.2f\n", t_start_ms + t, x, y);
     }
 
     printf("  t=%7.1f ms   X=%7.2f   Y=%7.2f  <- dich\n",
-           t_bat_dau + tong_ms, x1, y1);
+           t_start_ms + total_ms, x1, y1);
 }
 
 /* ═══════════════════════════════════════
    7. MAIN
    ═══════════════════════════════════════ */
 int main(int argc, char *argv[]) {
-    const char *ten_file = (argc > 1) ? argv[1] : "test.gcode";
+    const char *filepath = (argc > 1) ? argv[1] : "test.gcode";
 
-    printf("Doc file: %s\n\n", ten_file);
+    printf("Doc file: %s\n\n", filepath);
 
     struct GCommand commands[100];
-    int so_lenh = doc_file(ten_file, commands, 100);
-    printf("Tim thay %d lenh:\n\n", so_lenh);
+    int cmd_count = read_gcode_file(filepath, commands, 100);
+    printf("Tim thay %d lenh:\n\n", cmd_count);
 
     float cx = 0.0f, cy = 0.0f;
-    float t_ms = 0.0f;
+    float t_ms   = 0.0f;
     float feedrate = 3000.0f;  /* tốc độ mặc định G0: 3000 mm/phút (quy ước máy) */
 
     int i;
-    for (i = 0; i < so_lenh; i++) {
+    for (i = 0; i < cmd_count; i++) {
         struct GCommand *cmd = &commands[i];
         int is_arc = (cmd->code[1] == '2' || cmd->code[1] == '3');
 
@@ -261,57 +273,57 @@ int main(int argc, char *argv[]) {
         }
 
         /* điểm đích — nếu không có X/Y thì giữ nguyên vị trí */
-        float tx, ty;
+        float target_x, target_y;
         if (is_arc) {
-            tx = cmd->data.arc.has_x ? cmd->data.arc.x : cx;
-            ty = cmd->data.arc.has_y ? cmd->data.arc.y : cy;
+            target_x = cmd->data.arc.has_x ? cmd->data.arc.x : cx;
+            target_y = cmd->data.arc.has_y ? cmd->data.arc.y : cy;
         } else {
-            tx = cmd->data.linear.has_x ? cmd->data.linear.x : cx;
-            ty = cmd->data.linear.has_y ? cmd->data.linear.y : cy;
+            target_x = cmd->data.linear.has_x ? cmd->data.linear.x : cx;
+            target_y = cmd->data.linear.has_y ? cmd->data.linear.y : cy;
         }
 
         printf("--- Lenh %d: ", i+1);
-        in_lenh(cmd);
+        print_command(cmd);
 
         /* tính quỹ đạo */
         if (cmd->code[1] == '2') {
-            tinh_g2g3(cx, cy, tx, ty,
-                      cmd->data.arc.i, cmd->data.arc.j,
-                      1, feedrate, t_ms);
+            interpolate_arc(cx, cy, target_x, target_y,
+                            cmd->data.arc.i, cmd->data.arc.j,
+                            1, feedrate, t_ms);
         } else if (cmd->code[1] == '3') {
-            tinh_g2g3(cx, cy, tx, ty,
-                      cmd->data.arc.i, cmd->data.arc.j,
-                      0, feedrate, t_ms);
+            interpolate_arc(cx, cy, target_x, target_y,
+                            cmd->data.arc.i, cmd->data.arc.j,
+                            0, feedrate, t_ms);
         } else {
-            tinh_g1(cx, cy, tx, ty, feedrate, t_ms);
+            interpolate_linear(cx, cy, target_x, target_y, feedrate, t_ms);
         }
 
         /* cập nhật đồng hồ */
-        float toc_do = feedrate / 60.0f / 1000.0f;
+        float speed = feedrate / 60.0f / 1000.0f;
         if (is_arc) {
             float i_off = cmd->data.arc.has_i ? cmd->data.arc.i : 0.0f;
             float j_off = cmd->data.arc.has_j ? cmd->data.arc.j : 0.0f;
-            float R     = sqrt(i_off*i_off + j_off*j_off);
-            float tam_x = cx + i_off;
-            float tam_y = cy + j_off;
-            float goc_dau  = atan2(cy - tam_y, cx - tam_x);
-            float goc_cuoi = atan2(ty - tam_y, tx - tam_x);
-            float quet;
+            float R        = sqrt(i_off*i_off + j_off*j_off);
+            float center_x = cx + i_off;
+            float center_y = cy + j_off;
+            float angle_start = atan2(cy - center_y, cx - center_x);
+            float angle_end   = atan2(target_y - center_y, target_x - center_x);
+            float sweep;
             if (cmd->code[1] == '2') {
-                quet = goc_cuoi - goc_dau;
-                if (quet > 0) quet -= 2.0f * 3.14159f;
+                sweep = angle_end - angle_start;
+                if (sweep > 0) sweep -= 2.0f * 3.14159f;
             } else {
-                quet = goc_cuoi - goc_dau;
-                if (quet < 0) quet += 2.0f * 3.14159f;
+                sweep = angle_end - angle_start;
+                if (sweep < 0) sweep += 2.0f * 3.14159f;
             }
-            t_ms += fabs(quet) * R / toc_do;
+            t_ms += fabs(sweep) * R / speed;
         } else {
-            float dist = sqrt((tx-cx)*(tx-cx) + (ty-cy)*(ty-cy));
-            if (dist > 0.001f) t_ms += dist / toc_do;
+            float dist = sqrt((target_x-cx)*(target_x-cx) + (target_y-cy)*(target_y-cy));
+            if (dist > 0.001f) t_ms += dist / speed;
         }
 
-        cx = tx;
-        cy = ty;
+        cx = target_x;
+        cy = target_y;
 
         printf("\n");
     }
