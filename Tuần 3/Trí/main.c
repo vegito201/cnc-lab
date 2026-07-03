@@ -1,19 +1,24 @@
 /*
  * =============================================================
- * GCode Trajectory Calculator -- Trapezoidal Velocity Profile
+ * GCode Trajectory Calculator -- Trapezoid Velocity + Look-ahead
+ * (ban rut gon cua main.c -- output giong het tung byte)
  * =============================================================
  *
  * LUONG XU LY:
  *   file.gcode
  *      |
- *      v  parse_line()       
+ *      v  parse_line()          <- doc tung dong thanh GCommand
  *   GCommand[]
  *      |
- *      v  interpolate_*()    <- tinh quy dao theo thoi gian
- *   trajectory.csv           <- t_ms, x, y, v (moi 1ms 1 dong)
+ *      v  build_segments()      <- resolve hinh hoc (toa do, tam arc, do dai)
+ *   Segment[]
  *      |
- *      v  visualize.py       <- ve do thi
- *   trajectory_plot.png
+ *      v  compute_lookahead()   <- tinh van toc tai cac diem noi
+ *      |
+ *      v  interpolate_segment() <- tinh quy dao theo thoi gian
+ *   trajectory.csv              <- t_ms, x, y, v (moi 1ms 1 dong)
+ *      |
+ *      v  visualize.py          <- ve do thi
  */
 
 #include <stdio.h>
@@ -21,665 +26,362 @@
 #include <math.h>
 
 /* =============================================================
-   HANG SO
+   HANG SO (cac knob hieu chinh)
    ============================================================= */
 
 /* Gia toc toi da cua may (mm/s^2).
-   Giu gia tri nho -> may tang/giam toc cham, an toan cho co khi.
-   Giu gia tri lon -> may phan ung nhanh hon nhung rung nhieu hon.
-   500 mm/s^2 la gia tri trung binh cho may CNC hobby. */
+   Nho -> tang/giam toc cham, em may. Lon -> nhanh nhung rung.
+   500 la muc trung binh cho CNC hobby. */
 #define MAX_ACCELERATION  500.0f
 
-/* Toc do G0 (rapid move) tinh bang mm/min.
-   3000 mm/min = 50 mm/s. */
+/* Feedrate khoi tao (mm/min). 3000 mm/min = 50 mm/s. */
 #define RAPID_FEEDRATE   3000.0f
 
-/* Buoc thoi gian noi suy: 1ms.
-   Moi 1ms tinh 1 diem (x, y, v) va ghi vao CSV.
-   Tren phan cung thuc te, day la tan so cua Interpolator ISR:
-   bo dinh thi (timer) ngat moi 1ms va goi ham tinh vi tri moi. */
+/* Buoc thoi gian noi suy: 1ms = 1 diem CSV.
+   Tren phan cung thuc te day la chu ky ngat cua Interpolator ISR. */
 #define DT_MS               1.0f
 
-#define MODE_ABSOLUTE        90
-#define MODE_INCREMENTAL     91
+/* Thoi gian cho phep doi huong tai goc re (s) -- xem junction_velocity().
+   Dat = chu ky mau Ts (1ms) dung nhu eq 34 cua paper Chen 2013:
+   toan bo cu doi huong phai xong trong 1 tick -> bao thu tuyet doi,
+   goc sac tuyet doi nhung qua goc rat cham (goc 90 do ~ 0.35 mm/s).
+   Tang len (vd 0.02f = 20ms) = qua goc nhanh hon nhung goc bi bo tron. */
+#define JUNCTION_T         0.001f  /* 1ms = Ts, giong paper */
 
-/* ---- LOOK-AHEAD (Chen et al. 2013, eq 34) ----
-   Van toc toi da tai diem noi giua 2 doan:
-     v_junction <= a_max * T / (2 * sin(alpha/2))
-   alpha = goc giua 2 vector tiep tuyen tai diem noi.
-
-   Y nghia: khi qua goc re alpha voi toc do v, vector van toc doi huong
-   dot ngot, do bien thien |dv| = 2*v*sin(alpha/2). Bien thien nay phai
-   thuc hien duoc voi gia toc <= a_max trong khoang thoi gian T.
-
-   Dat T = Ts = 1ms dung nhu paper: toan bo cu doi huong phai xong
-   trong 1 tick -> bao thu, goc sac tuyet doi nhung qua goc gat rat
-   cham (90 do ~ 0.35 mm/s). Muon nhanh hon co the noi T len,
-   doi lai goc bi bo tron. */
-#define JUNCTION_T        0.001f  /* 1ms = Ts, giong paper */
-
-#define MAX_SEGMENTS       100
+#define MAX_SEGMENTS        100
 
 /* =============================================================
-   STRUCT DATA
+   G-CODE PARSING
    ============================================================= */
 
-/* Lenh G-code tuyen tinh (G0, G1): chi can dich den X, Y va toc do F. */
-struct LinearCmd {
-    float x, y, z;
-    float f;
-    int has_x, has_y;   /* 1 neu dong G-code co gia tri X / Y */
-    int has_f;
-};
-
-/* Lenh G-code cung tron (G2, G3): them cac tham so I, J (offset tam),
-   hoac R (ban kinh). */
-struct ArcCmd {
-    float x, y, z;
-    float f;
-    float i, j;   /* offset tu diem dau den tam cung: cx = x0+I, cy = y0+J */
-    float r;      /* ban kinh (thay the I,J neu nguoi dung dung cach ngan) */
-    int has_x, has_y;
-    int has_i, has_j;
-    int has_f, has_r;
-};
-
-/* Mot lenh G-code day du.
-   Dung union de tiet kiem bo nho: moi lenh chi la linear HOAC arc,
-   khong bao gio ca hai cung luc. */
+/* Mot lenh G-code sau khi parse.
+   Lenh thang (G0/G1) chi dung x,y,f; lenh cung (G2/G3) dung them i,j,r.
+   ponytail: 1 struct phang thay cho union linear/arc nhu ban goc --
+   vai float khong dung (i,j,r nam im khi lenh thang) re hon viec
+   moi cho doc du lieu phai viet code 2 nhanh arc/linear. */
 struct GCommand {
-    char code[4];      /* "G0", "G1", "G2", "G3", hoac "" neu khong co */
-    int  mode_change;  /* 0 = khong doi, 90 = G90 absolute, 91 = G91 incremental */
-    union {
-        struct LinearCmd linear;
-        struct ArcCmd    arc;
-    } data;
-};
-
-/* =============================================================
-   TRAPEZOID PROFILE
-   =============================================================
-   
-   Profil hinh thang chia doan duong di thanh 3 giai doan:
-   
-       v (mm/s)
-       |         ___________
-   v_peak|        /           \
-       |       /             \
-   v_entry|____/               \____v_exit
-       |
-       +-----|-----------|-----|---> t (s)
-         t_accel   t_cruise  t_decel
-   
-   Cong thuc tinh v_peak (khi doan ngan, khong dat duoc feedrate):
-     v_peak = sqrt(a * s + (v_entry^2 + v_exit^2) / 2)
-   
-   Giai thich: dung phuong trinh dong nang (energy equation).
-   Nang luong tich luy khi tang toc tu v_entry len v_peak:
-     E_accel = (v_peak^2 - v_entry^2) / (2*a)   [= quang duong tang toc]
-   Nang luong giai phong khi giam toc tu v_peak xuong v_exit:
-     E_decel = (v_peak^2 - v_exit^2) / (2*a)
-   Tong = do dai doan s:
-     s = E_accel + E_decel
-     => giai ra v_peak theo s, v_entry, v_exit.
-*/
-struct TrapezoidProfile {
-    float v_entry;      /* van toc vao dau doan  (mm/s) */
-    float v_peak;       /* van toc dinh           (mm/s) */
-    float v_exit;       /* van toc ra cuoi doan   (mm/s) */
-    float t_accel;      /* thoi gian tang toc     (s)    */
-    float t_cruise;     /* thoi gian di deu       (s)    */
-    float t_decel;      /* thoi gian giam toc     (s)    */
-    float total_time;   /* tong thoi gian cua doan (s)   */
-    float s_accel;      /* quang duong tang toc   (mm)   */
-    float s_cruise;     /* quang duong di deu     (mm)   */
+    char  code[4];      /* "G0".."G3", "" neu dong khong co lenh di chuyen */
+    int   mode_change;  /* 0 = khong doi, 90 = G90 absolute, 91 = G91 incremental */
+    float x, y;         /* toa do dich */
+    float i, j;         /* offset tu diem dau den tam cung: tam = (x0+I, y0+J) */
+    float r;            /* ban kinh cung (cach viet thay cho I,J) */
+    float f;            /* feedrate (mm/min) */
+    int   has_x, has_y, has_i, has_j, has_r, has_f;  /* 1 neu dong co tham so do */
 };
 
 /*
- * compute_trapezoid: tinh day du thong so profil cho mot doan.
+ * parse_line: doc 1 dong G-code thanh GCommand.
  *
- * Vi du: doan 50mm, F3000 mm/min, v_entry=0, v_exit=0
- *   v_max = 3000/60 = 50 mm/s
- *   v_peak_achievable = sqrt(500*50 + 0) = sqrt(25000) = 158 mm/s > 50 -> dung v_max
- *   v_peak = 50 mm/s
- *   t_accel = (50-0)/500 = 0.1 s
- *   s_accel = 50^2/(2*500) = 2.5 mm
- *   s_cruise = 50 - 2.5 - 2.5 = 45 mm
- *   t_cruise = 45/50 = 0.9 s
- *   total = 0.1 + 0.9 + 0.1 = 1.1 s = 1100 ms
+ * Cac dac diem cua G-code phai xu ly:
+ *   1. N number: so thu tu dong, tuy chon ("N40 G01 X10") -> bo qua.
+ *   2. Comment trong ngoac don: "G01 X10 (di den diem A)" -> xoa truoc khi parse.
+ *   3. Modal: dong khong co G0-G3 thi dung lenh G cuoi cung con hieu luc.
+ *      Vi du "N70 Y10" sau mot dong G1 -> hieu la G1 Y10.
+ *   4. Nhieu G tren 1 dong: "G90 G01 X10" -> xu ly tat ca.
+ *
+ * Tham so:
+ *   line       - chuoi 1 dong G-code
+ *   modal_code - G code dang hieu luc tu dong truoc
  */
-struct TrapezoidProfile compute_trapezoid(float segment_length,
-                                          float feedrate,
-                                          float v_entry,
-                                          float v_exit) {
-    struct TrapezoidProfile prof;
-    float v_max = feedrate / 60.0f;  /* mm/min -> mm/s */
-    float a     = MAX_ACCELERATION;
-    float s_decel;
-
-    /* dam bao khong vuot gioi han feedrate */
-    if (v_entry > v_max) v_entry = v_max;
-    if (v_exit  > v_max) v_exit  = v_max;
-
-    /* tinh v_peak theo cong thuc energy equation.
-       Neu doan du dai -> v_peak_achievable > v_max -> dung v_max (profil day du 3 pha).
-       Neu doan ngan    -> v_peak_achievable < v_max -> dung v_peak_achievable (profil tam giac). */
-    float v_peak_achievable = sqrtf(a * segment_length
-                                    + (v_entry*v_entry + v_exit*v_exit) / 2.0f);
-    float v_peak = (v_peak_achievable < v_max) ? v_peak_achievable : v_max;
-
-    prof.v_entry  = v_entry;
-    prof.v_peak   = v_peak;
-    prof.v_exit   = v_exit;
-
-    /* thoi gian tang toc: v = v_entry + a*t  =>  t = (v_peak - v_entry) / a */
-    prof.t_accel  = (v_peak - v_entry) / a;
-    prof.t_decel  = (v_peak - v_exit)  / a;
-
-    /* quang duong tang toc: s = (v_peak^2 - v_entry^2) / (2*a)
-       (phuong trinh dong hoc: v^2 = v0^2 + 2*a*s) */
-    prof.s_accel  = (v_peak*v_peak - v_entry*v_entry) / (2.0f * a);
-    s_decel       = (v_peak*v_peak - v_exit*v_exit)   / (2.0f * a);
-
-    prof.s_cruise = segment_length - prof.s_accel - s_decel;
-    if (prof.s_cruise < 0.0f) prof.s_cruise = 0.0f;
-
-    /* t_cruise = s_cruise / v_peak  (chuyen dong deu: s = v*t) */
-    prof.t_cruise    = (prof.s_cruise > 0.0f) ? prof.s_cruise / v_peak : 0.0f;
-    prof.total_time  = prof.t_accel + prof.t_cruise + prof.t_decel;
-
-    return prof;
-}
-
-/*
- * trapezoid_state: tra ve vi tri s (mm) va van toc v (mm/s)
- * tai thoi diem t_sec (giay) trong profil.
- *
- * Dung cong thuc dong hoc (analytic, khong tich phan so):
- *   Pha 1 tang toc:  v = v_entry + a*t
- *                    s = v_entry*t + 0.5*a*t^2
- *   Pha 2 di deu:    v = v_peak
- *                    s = s_accel + v_peak*(t - t_accel)
- *   Pha 3 giam toc:  v = v_peak - a*t_d      (t_d = thoi gian ke tu luc bat dau giam)
- *                    s = s_accel + s_cruise + v_peak*t_d - 0.5*a*t_d^2
- *
- * Tai sao dung analytic thay vi numerical integration?
- * Neu cong don dv moi 1ms: loi lam tron tich luy theo thoi gian.
- * Analytic: tinh truc tiep tu t -> khong co loi tich luy.
- */
-void trapezoid_state(float t_sec,
-                     const struct TrapezoidProfile *prof,
-                     float *out_s,
-                     float *out_v) {
-    float a = MAX_ACCELERATION;
-
-    if (t_sec <= prof->t_accel) {
-        /* giai doan 1: tang toc */
-        *out_v = prof->v_entry + a * t_sec;
-        *out_s = prof->v_entry * t_sec + 0.5f * a * t_sec * t_sec;
-
-    } else if (t_sec <= prof->t_accel + prof->t_cruise) {
-        /* giai doan 2: di deu */
-        float t_in_cruise = t_sec - prof->t_accel;
-        *out_v = prof->v_peak;
-        *out_s = prof->s_accel + prof->v_peak * t_in_cruise;
-
-    } else {
-        /* giai doan 3: giam toc */
-        float t_in_decel = t_sec - prof->t_accel - prof->t_cruise;
-        *out_v = prof->v_peak - a * t_in_decel;
-        if (*out_v < prof->v_exit) *out_v = prof->v_exit; /* khong xuong duoi v_exit */
-        *out_s = prof->s_accel + prof->s_cruise
-                 + prof->v_peak * t_in_decel
-                 - 0.5f * a * t_in_decel * t_in_decel;
-    }
-}
-
-/* =============================================================
-   print_command: debug helper
-   ============================================================= */
-void print_command(struct GCommand *cmd) {
-    int is_arc = (cmd->code[1] == '2' || cmd->code[1] == '3');
-    printf("[%s]", cmd->code);
-    if (is_arc) {
-        if (cmd->data.arc.has_x) printf(" X=%.2f", cmd->data.arc.x);
-        if (cmd->data.arc.has_y) printf(" Y=%.2f", cmd->data.arc.y);
-        if (cmd->data.arc.has_i) printf(" I=%.2f", cmd->data.arc.i);
-        if (cmd->data.arc.has_j) printf(" J=%.2f", cmd->data.arc.j);
-        if (cmd->data.arc.has_r) printf(" R=%.2f", cmd->data.arc.r);
-        if (cmd->data.arc.has_f) printf(" F=%.2f", cmd->data.arc.f);
-    } else {
-        if (cmd->data.linear.has_x) printf(" X=%.2f", cmd->data.linear.x);
-        if (cmd->data.linear.has_y) printf(" Y=%.2f", cmd->data.linear.y);
-        if (cmd->data.linear.has_f) printf(" F=%.2f", cmd->data.linear.f);
-    }
-    printf("\n");
-}
-
-/* =============================================================
-   parse_line: doc 1 dong G-code, tra ve GCommand
-   =============================================================
-   
-   G-code co nhieu dac diem can xu ly:
-   
-   1. N number: so dong tuy chon o dau moi dong (vi du "N40 G01 X10")
-      -> bo qua, khong anh huong lenh.
-   
-   2. Comment trong ngoac don: "G01 X10 (day la comment)"
-      -> loai bo truoc khi parse.
-   
-   3. Modal G-code: neu dong khong co G0-G3, dung lenh cuoi cung con hieu luc.
-      Vi du: "N70 Y10" -> khong co G, dung modal_code tu dong truoc (G1).
-      Day la dac diem quan trong cua G-code: mot khi dat G1, no "nho" den
-      khi bi thay the boi lenh G khac.
-   
-   4. Nhieu G tren 1 dong: "G90 G01 X10" -> xu ly tat ca.
-   
-   Tham so:
-     line       - chuoi ki tu cua 1 dong G-code
-     modal_code - G code dang hieu luc tu dong truoc (G0/G1/G2/G3)
-*/
 struct GCommand parse_line(char *line, const char *modal_code) {
     struct GCommand cmd;
     char clean[256];
-    char *read_cursor;   /* vi tri dang doc trong chuoi input goc  */
-    char *write_cursor;  /* vi tri dang ghi trong buffer clean     */
-    char *scan_pos;      /* vi tri dang quet tim ki tu cu the      */
-    int depth, g_num, is_arc;
+    char *p, *w;
+    int depth, g_num, k;
 
     memset(&cmd, 0, sizeof(cmd));
 
-    /* --- Buoc 1: Bo qua N number --- */
-    read_cursor = line;
-    while (*read_cursor == ' ' || *read_cursor == '\t') read_cursor++;
-    if (*read_cursor == 'N') {
-        read_cursor++;
-        while (*read_cursor >= '0' && *read_cursor <= '9') read_cursor++;
-        while (*read_cursor == ' '  || *read_cursor == '\t') read_cursor++;
+    /* buoc 1: bo N number dau dong */
+    p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == 'N') {
+        p++;
+        while (*p >= '0' && *p <= '9') p++;
     }
 
-    /* --- Buoc 2: Xoa comment (...) bang cach copy qua buffer moi ---
-       depth dem so ngoac mo chua dong.
-       Ki tu ben trong ngoac (depth>0) khong duoc copy sang clean. */
-    write_cursor = clean;
+    /* buoc 2: copy sang buffer 'clean', bo ki tu nam trong ngoac don.
+       depth dem so ngoac mo chua dong (ho tro ngoac long nhau). */
+    w = clean;
     depth = 0;
-    while (*read_cursor) {
-        if (*read_cursor == '(') { depth++; read_cursor++; continue; }
-        if (*read_cursor == ')') { depth--; read_cursor++; continue; }
-        if (depth == 0) *write_cursor++ = *read_cursor;
-        read_cursor++;
+    for (; *p; p++) {
+        if (*p == '(') { depth++; continue; }
+        if (*p == ')') { depth--; continue; }
+        if (depth == 0) *w++ = *p;
     }
-    *write_cursor = '\0';
+    *w = '\0';
 
-    /* --- Buoc 3: Tim tat ca G code trong dong ---
-       strchr tim ki tu 'G' tiep theo. sscanf doc so nguyen sau G.
-       G90/G91: cap nhat mode_change.
-       G0-G3:   cap nhat cmd.code. */
-    scan_pos = clean;
-    while ((scan_pos = strchr(scan_pos, 'G')) != NULL) {
-        sscanf(scan_pos, "G%d", &g_num);
-        if      (g_num == 90) cmd.mode_change = 90;
-        else if (g_num == 91) cmd.mode_change = 91;
-        else if (g_num >= 0 && g_num <= 3)
-            snprintf(cmd.code, 4, "G%d", g_num);
-        scan_pos++;
+    /* buoc 3: tim tat ca G code tren dong.
+       strchr nhay den tung chu 'G', sscanf doc so nguyen ngay sau no. */
+    for (p = clean; (p = strchr(p, 'G')) != NULL; p++) {
+        sscanf(p, "G%d", &g_num);
+        if (g_num == 90 || g_num == 91) cmd.mode_change = g_num;
+        else if (g_num >= 0 && g_num <= 3) snprintf(cmd.code, 4, "G%d", g_num);
     }
 
-    /* --- Buoc 4: Ap dung modal G-code neu can ---
-       Neu dong nay khong co G0-G3 tuong minh nhung co X/Y/F,
-       su dung lenh cuoi cung con hieu luc (modal_code). */
+    /* buoc 4: dong khong co G0-G3 -> ke thua lenh modal cua dong truoc */
     if (cmd.code[0] == '\0' && modal_code && modal_code[0] != '\0')
-        strncpy(cmd.code, modal_code, 4);
-
+        memcpy(cmd.code, modal_code, 4);
     if (cmd.code[0] == '\0') return cmd;
 
-    /* --- Buoc 5: Parse cac tham so X, Y, I, J, R, F ---
-       strchr tim vi tri cua ki tu, sau do sscanf doc so thap phan. */
-    is_arc = (cmd.code[1] == '2' || cmd.code[1] == '3');
-    if (is_arc) {
-        scan_pos = strchr(clean, 'X');
-        if (scan_pos) { sscanf(scan_pos, "X%f", &cmd.data.arc.x); cmd.data.arc.has_x = 1; }
-        scan_pos = strchr(clean, 'Y');
-        if (scan_pos) { sscanf(scan_pos, "Y%f", &cmd.data.arc.y); cmd.data.arc.has_y = 1; }
-        scan_pos = strchr(clean, 'I');
-        if (scan_pos) { sscanf(scan_pos, "I%f", &cmd.data.arc.i); cmd.data.arc.has_i = 1; }
-        scan_pos = strchr(clean, 'J');
-        if (scan_pos) { sscanf(scan_pos, "J%f", &cmd.data.arc.j); cmd.data.arc.has_j = 1; }
-        scan_pos = strchr(clean, 'R');
-        if (scan_pos) { sscanf(scan_pos, "R%f", &cmd.data.arc.r); cmd.data.arc.has_r = 1; }
-        scan_pos = strchr(clean, 'F');
-        if (scan_pos) { sscanf(scan_pos, "F%f", &cmd.data.arc.f); cmd.data.arc.has_f = 1; }
-    } else {
-        scan_pos = strchr(clean, 'X');
-        if (scan_pos) { sscanf(scan_pos, "X%f", &cmd.data.linear.x); cmd.data.linear.has_x = 1; }
-        scan_pos = strchr(clean, 'Y');
-        if (scan_pos) { sscanf(scan_pos, "Y%f", &cmd.data.linear.y); cmd.data.linear.has_y = 1; }
-        scan_pos = strchr(clean, 'F');
-        if (scan_pos) { sscanf(scan_pos, "F%f", &cmd.data.linear.f); cmd.data.linear.has_f = 1; }
+    /* buoc 5: doc cac tham so. Voi moi chu cai trong "XYIJRF":
+       strchr tim vi tri chu cai do, sscanf doc so thap phan ngay sau.
+       vals[k]/flags[k] tro den field tuong ung trong cmd -- them tham so
+       moi (vd Z) chi can them 1 chu cai va 1 cap con tro. */
+    {
+        const char letters[]  = "XYIJRF";
+        float *vals[]  = { &cmd.x, &cmd.y, &cmd.i, &cmd.j, &cmd.r, &cmd.f };
+        int   *flags[] = { &cmd.has_x, &cmd.has_y, &cmd.has_i,
+                           &cmd.has_j, &cmd.has_r, &cmd.has_f };
+        for (k = 0; k < 6; k++) {
+            p = strchr(clean, letters[k]);
+            if (p && sscanf(p + 1, "%f", vals[k]) == 1) *flags[k] = 1;
+        }
     }
-
     return cmd;
 }
 
-/* =============================================================
-   read_gcode_file: doc toan bo file, tra ve mang GCommand
-   ============================================================= */
-int read_gcode_file(const char *filepath,
-                    struct GCommand *commands,
-                    int max_cmd) {
+/* read_gcode_file: doc toan bo file, tra ve so lenh doc duoc.
+   Bo qua dong comment (bat dau bang ';') va dong trong.
+   modal_code luu lenh G cuoi cung de dong sau ke thua (dac tinh modal). */
+int read_gcode_file(const char *filepath, struct GCommand *commands, int max_cmd) {
     FILE *file = fopen(filepath, "r");
     if (!file) { printf("Error: Cannot open %s\n", filepath); return 0; }
 
     char line[256];
     int  cmd_count = 0;
-    char modal_code[4] = "";  /* luu G code cuoi cung con hieu luc */
+    char modal_code[4] = "";
 
     while (fgets(line, 256, file)) {
-        if (line[0] == ';') continue;   /* dong comment (;...) */
-        if (line[0] == '\n') continue;  /* dong trong */
-
+        if (line[0] == ';' || line[0] == '\n') continue;
         struct GCommand cmd = parse_line(line, modal_code);
-
-        /* cap nhat modal_code de dong tiep theo ke thua */
-        if (cmd.code[0] != '\0')
-            strncpy(modal_code, cmd.code, 4);
-
-        /* bo qua dong khong co gi */
-        if (cmd.code[0] == '\0' && cmd.mode_change == 0) continue;
-
+        if (cmd.code[0] != '\0') memcpy(modal_code, cmd.code, 4);
+        if (cmd.code[0] == '\0' && cmd.mode_change == 0) continue;  /* dong rong */
         commands[cmd_count++] = cmd;
         if (cmd_count >= max_cmd) break;
     }
-
     fclose(file);
     return cmd_count;
 }
 
 /* =============================================================
-   interpolate_linear: noi suy duong thang voi trapezoid velocity
+   TRAPEZOID PROFILE
    =============================================================
-   
-   Thuat toan:
-   1. Tinh do dai doan: L = sqrt(dx^2 + dy^2)
-   2. Tinh profil hinh thang cho doan do (compute_trapezoid)
-   3. Vong lap moi 1ms:
-        a. Tinh s(t) va v(t) tu profil (trapezoid_state)
-        b. Tinh alpha = s / L  (vi tri tren doan, 0..1)
-        c. x = x0 + alpha*dx,  y = y0 + alpha*dy
-        d. Ghi vao CSV: t_ms, x, y, v
-   4. Ghi diem cuoi chinh xac (x1, y1)
-   
-   Tra ve: thoi gian thuc hien (ms) de main() cap nhat t_ms tong.
-   
-   Tham so v_entry, v_exit hien tai = 0 (moi doan dung lai hoan toan).
-   Khi co look-ahead: truyen vao van toc goc tai junction.
+
+   Chia moi doan duong thanh 3 pha van toc:
+
+       v (mm/s)
+       |           ___________
+   v_peak         /           \
+       |         /             \
+   v_entry _____/               \_____ v_exit
+       |
+       +-------|-----------|-------|---> t (s)
+         t_accel   t_cruise   t_decel
+
+   Khi doan du dai: v_peak = feedrate (hinh thang day du).
+   Khi doan ngan, khong kip tang den feedrate: profil thanh tam giac,
+   dinh tam giac tinh tu phuong trinh dong hoc v^2 = v0^2 + 2as:
+     - quang duong tang toc: s_acc = (v_peak^2 - v_entry^2) / 2a
+     - quang duong giam toc: s_dec = (v_peak^2 - v_exit^2)  / 2a
+     - tong s_acc + s_dec = do dai doan s, giai ra:
+         v_peak = sqrt(a*s + (v_entry^2 + v_exit^2)/2)
+
+   Vi du: doan 50mm, F3000 (=50mm/s), v_entry = v_exit = 0:
+     v_peak kha thi = sqrt(500*50) = 158 > 50 -> chay o 50 mm/s
+     t_accel = 50/500 = 0.1s, s_accel = 2.5mm
+     s_cruise = 50 - 2.5 - 2.5 = 45mm -> t_cruise = 0.9s
+     tong = 0.1 + 0.9 + 0.1 = 1.1s
 */
-float interpolate_linear(float x0, float y0,
-                         float x1, float y1,
-                         float feedrate,
-                         float v_entry, float v_exit,
-                         float t_start_ms,
-                         FILE *csv) {
-    float dx             = x1 - x0;
-    float dy             = y1 - y0;
-    float segment_length = sqrtf(dx*dx + dy*dy);
-    if (segment_length < 0.001f) return 0.0f;  /* doan qua ngan, bo qua */
+struct TrapezoidProfile {
+    float v_entry, v_peak, v_exit;      /* van toc vao / dinh / ra (mm/s) */
+    float t_accel, t_cruise, t_decel;   /* thoi gian 3 pha (s) */
+    float total_time;                   /* tong thoi gian doan (s) */
+    float s_accel, s_cruise;            /* quang duong pha 1, pha 2 (mm) */
+};
 
-    struct TrapezoidProfile prof = compute_trapezoid(segment_length, feedrate,
-                                                     v_entry, v_exit);
-    float total_ms = prof.total_time * 1000.0f;
+struct TrapezoidProfile compute_trapezoid(float segment_length, float feedrate,
+                                          float v_entry, float v_exit) {
+    struct TrapezoidProfile prof;
+    float v_max = feedrate / 60.0f;  /* mm/min -> mm/s */
+    float a     = MAX_ACCELERATION;
 
-    float t_ms;
-    for (t_ms = 0.0f; t_ms < total_ms; t_ms += DT_MS) {
-        float s, v;
-        trapezoid_state(t_ms / 1000.0f, &prof, &s, &v);
+    /* van toc vao/ra khong duoc vuot feedrate */
+    if (v_entry > v_max) v_entry = v_max;
+    if (v_exit  > v_max) v_exit  = v_max;
 
-        /* alpha = phan tram do dai da di duoc (0 = dau, 1 = cuoi) */
-        float alpha = s / segment_length;
-        if (alpha > 1.0f) alpha = 1.0f;
+    /* v_peak kha thi theo cong thuc o tren; cap boi feedrate */
+    float v_peak = sqrtf(a * segment_length
+                         + (v_entry*v_entry + v_exit*v_exit) / 2.0f);
+    if (v_peak > v_max) v_peak = v_max;
 
-        /* noi suy tuyen tinh: P = P0 + alpha*(P1-P0) */
-        float x = x0 + alpha * dx;
-        float y = y0 + alpha * dy;
+    prof.v_entry = v_entry;
+    prof.v_peak  = v_peak;
+    prof.v_exit  = v_exit;
+    prof.t_accel = (v_peak - v_entry) / a;               /* tu v = v0 + at */
+    prof.t_decel = (v_peak - v_exit)  / a;
+    prof.s_accel = (v_peak*v_peak - v_entry*v_entry) / (2.0f * a);  /* v^2 = v0^2 + 2as */
 
-        if (csv) fprintf(csv, "%.1f,%.4f,%.4f,%.3f\n",
-                         t_start_ms + t_ms, x, y, v);
-    }
-
-    /* dam bao diem cuoi chinh xac (tranh loi lam tron float) */
-    if (csv) fprintf(csv, "%.1f,%.4f,%.4f,%.3f\n",
-                     t_start_ms + total_ms, x1, y1, prof.v_exit);
-
-    printf("  v_entry=%.1f  v_peak=%.1f  v_exit=%.1f mm/s  |  %.0f ms\n",
-           prof.v_entry, prof.v_peak, prof.v_exit, total_ms);
-
-    return total_ms;
+    float s_decel = (v_peak*v_peak - v_exit*v_exit) / (2.0f * a);
+    prof.s_cruise = segment_length - prof.s_accel - s_decel;
+    if (prof.s_cruise < 0.0f) prof.s_cruise = 0.0f;      /* profil tam giac */
+    prof.t_cruise   = (prof.s_cruise > 0.0f) ? prof.s_cruise / v_peak : 0.0f;
+    prof.total_time = prof.t_accel + prof.t_cruise + prof.t_decel;
+    return prof;
 }
-
-/* =============================================================
-   interpolate_arc: noi suy cung tron voi trapezoid velocity
-   =============================================================
-   
-   Cung tron duoc xac dinh boi:
-     - Diem dau (x0, y0), diem cuoi (x1, y1)
-     - Tam: cx = x0 + I,  cy = y0 + J   (neu dung I,J)
-     - Hoac ban kinh R (neu dung R: tinh cx, cy tu R)
-   
-   Tham so R: co 2 cung tron noi (x0,y0) va (x1,y1) voi ban kinh R.
-   Chon cung nao tuy thuoc dau cua R va chieu quay G2/G3:
-     R > 0: cung nho hon 180 do
-     R < 0: cung lon hon 180 do
-   
-   Thuat toan noi suy cung:
-   1. Tinh cx, cy (neu dung R)
-   2. Tinh angle_start, angle_end (atan2)
-   3. Tinh sweep angle (bao nhieu radian quay duoc)
-   4. arc_length = |sweep| * R
-   5. Tinh trapezoid tren arc_length
-   6. Moi 1ms: tinh s(t) -> alpha -> angle = angle_start + alpha*sweep
-              -> x = cx + R*cos(angle),  y = cy + R*sin(angle)
-*/
-/* prototype: dinh nghia o phan LOOK-AHEAD phia duoi,
-   nhung interpolate_arc cung can dung */
-void arc_sweep(float x0, float y0, float x1, float y1,
-               float cx, float cy, int clockwise,
-               float *out_angle_start, float *out_sweep);
 
 /*
- * arc_center_from_r: tinh offset tam (i_off, j_off) tu ban kinh R.
+ * trapezoid_state: vi tri s (mm) va van toc v (mm/s) tai thoi diem t_sec.
  *
- * Co 2 cung tron noi (x0,y0) va (x1,y1) voi ban kinh R.
- * Chon cung nao tuy thuoc dau cua R va chieu quay G2/G3:
- *   R > 0: cung nho hon 180 do
- *   R < 0: cung lon hon 180 do
- *
- * Phuong phap: tam nam tren duong trung truc cua day cung,
- * cach trung diem mot khoang h = sqrt(R^2 - (d/2)^2).
- *
- * Tra ve 1 neu hop le, 0 neu hinh hoc sai (d qua lon so voi R).
+ * Tinh analytic (truc tiep tu t bang cong thuc dong hoc) thay vi
+ * cong don dv moi 1ms -- cong don se tich luy loi lam tron theo thoi gian,
+ * analytic thi khong.
+ *   Pha 1 tang toc: v = v_entry + a*t,  s = v_entry*t + a*t^2/2
+ *   Pha 2 di deu:   v = v_peak,         s = s_accel + v_peak*t
+ *   Pha 3 giam toc: v = v_peak - a*t,   s = s_accel + s_cruise + v_peak*t - a*t^2/2
+ * (t trong moi pha tinh tu dau pha do)
  */
-int arc_center_from_r(float x0, float y0,
-                      float x1, float y1,
-                      float r, int clockwise,
-                      float *out_i, float *out_j) {
-    float dx = x1 - x0;
-    float dy = y1 - y0;
-    float d  = sqrtf(dx*dx + dy*dy);  /* khoang cach hai diem */
-    if (d < 0.001f || d > 2.0f * fabsf(r) + 0.01f) {
-        printf("  [WARN] arc geometry invalid: d=%.2f R=%.2f\n", d, fabsf(r));
-        return 0;
-    }
-    float h_sq = r*r - (d/2.0f)*(d/2.0f);
-    float h    = (h_sq > 0.0f) ? sqrtf(h_sq) : 0.0f;
-    float mx   = (x0 + x1) / 2.0f;
-    float my   = (y0 + y1) / 2.0f;
-    /* vector vuong goc voi day cung (chieu quay 90 do) */
-    float px   = -dy / d;
-    float py   =  dx / d;
-    /* sign xac dinh tam o phia nao cua day cung (R>0 hay R<0) */
-    float sign = (r > 0) ? 1.0f : -1.0f;
-    float center_x, center_y;
-    if (clockwise) {
-        center_x = mx + sign * h * px;
-        center_y = my + sign * h * py;
+void trapezoid_state(float t_sec, const struct TrapezoidProfile *prof,
+                     float *out_s, float *out_v) {
+    float a = MAX_ACCELERATION;
+
+    if (t_sec <= prof->t_accel) {
+        /* pha 1: tang toc */
+        *out_v = prof->v_entry + a * t_sec;
+        *out_s = prof->v_entry * t_sec + 0.5f * a * t_sec * t_sec;
+    } else if (t_sec <= prof->t_accel + prof->t_cruise) {
+        /* pha 2: di deu */
+        float t = t_sec - prof->t_accel;
+        *out_v = prof->v_peak;
+        *out_s = prof->s_accel + prof->v_peak * t;
     } else {
-        center_x = mx - sign * h * px;
-        center_y = my - sign * h * py;
+        /* pha 3: giam toc */
+        float t = t_sec - prof->t_accel - prof->t_cruise;
+        *out_v = prof->v_peak - a * t;
+        if (*out_v < prof->v_exit) *out_v = prof->v_exit;  /* khong tut duoi v_exit */
+        *out_s = prof->s_accel + prof->s_cruise
+                 + prof->v_peak * t - 0.5f * a * t * t;
     }
-    *out_i = center_x - x0;
-    *out_j = center_y - y0;
-    return 1;
-}
-
-float interpolate_arc(float x0, float y0,
-                      float x1, float y1,
-                      float i_off, float j_off,
-                      float r,
-                      int clockwise,
-                      float feedrate,
-                      float v_entry, float v_exit,
-                      float t_start_ms,
-                      FILE *csv) {
-
-    /* --- Tinh cx, cy tu R neu can --- */
-    if (r != 0.0f) {
-        if (!arc_center_from_r(x0, y0, x1, y1, r, clockwise, &i_off, &j_off))
-            return 0.0f;
-    }
-
-    float center_x   = x0 + i_off;
-    float center_y   = y0 + j_off;
-    float arc_radius  = sqrtf(i_off*i_off + j_off*j_off);
-    if (arc_radius < 0.001f) return 0.0f;
-
-    /* goc bat dau va goc quet (dau cua sweep theo chieu quay G2/G3) */
-    float angle_start, sweep;
-    arc_sweep(x0, y0, x1, y1, center_x, center_y, clockwise,
-              &angle_start, &sweep);
-
-    /* do dai cung = ban kinh * goc quay (radian) */
-    float arc_length = fabsf(sweep) * arc_radius;
-    struct TrapezoidProfile prof = compute_trapezoid(arc_length, feedrate,
-                                                     v_entry, v_exit);
-    float total_ms = prof.total_time * 1000.0f;
-
-    float t_ms;
-    for (t_ms = 0.0f; t_ms < total_ms; t_ms += DT_MS) {
-        float s, v;
-        trapezoid_state(t_ms / 1000.0f, &prof, &s, &v);
-
-        float alpha = s / arc_length;
-        if (alpha > 1.0f) alpha = 1.0f;
-        float angle = angle_start + alpha * sweep;
-
-        /* diem tren cung: P = tam + R*(cos, sin) */
-        float x = center_x + arc_radius * cosf(angle);
-        float y = center_y + arc_radius * sinf(angle);
-
-        if (csv) fprintf(csv, "%.1f,%.4f,%.4f,%.3f\n",
-                         t_start_ms + t_ms, x, y, v);
-    }
-
-    if (csv) fprintf(csv, "%.1f,%.4f,%.4f,%.3f\n",
-                     t_start_ms + total_ms, x1, y1, prof.v_exit);
-
-    printf("  v_entry=%.1f  v_peak=%.1f  v_exit=%.1f mm/s  |  %.0f ms\n",
-           prof.v_entry, prof.v_peak, prof.v_exit, total_ms);
-
-    return total_ms;
 }
 
 /* =============================================================
-   LOOK-AHEAD (Chen et al. 2013)
-   =============================================================
-
-   Truoc khi noi suy, doc truoc TOAN BO cac doan de biet hinh dang
-   duong chay -> tinh van toc tai moi diem noi (junction) -> moi doan
-   khong can dung ve 0 nua.
-
-   3 buoc:
-     1. Tinh v_junction tai moi diem noi tu goc chuyen huong (eq 34)
-     2. Backward pass: tu cuoi ve dau, dam bao doan i GIAM kip
-        tu v[i] xuong v[i+1] trong chieu dai L[i]
-     3. Forward pass: tu dau ve cuoi, dam bao doan i TANG kip
-        tu v[i] len v[i+1] trong chieu dai L[i]
-
-   Sau 2 pass, moi cap (v[i], v[i+1]) deu thoa man
-     |v[i+1]^2 - v[i]^2| <= 2*a*L[i]
-   nen compute_trapezoid() luon dung duoc profil hop le.
-*/
+   SEGMENT GEOMETRY
+   ============================================================= */
 
 /* Mot doan chuyen dong da resolve day du hinh hoc.
-   Duoc xay truoc khi noi suy de look-ahead co the "nhin" toan bo. */
+   Duoc xay TRUOC khi noi suy, de look-ahead nhin duoc toan bo duong chay
+   (biet doan sau re huong nao thi moi biet doan truoc duoc phep ra nhanh bao nhieu). */
 struct Segment {
     int   is_arc;
-    int   clockwise;             /* chi co nghia khi is_arc = 1 */
-    float x0, y0, x1, y1;
-    float i_off, j_off;          /* offset tam (da resolve tu R neu can) */
+    int   clockwise;             /* chi co nghia khi is_arc: G2 = 1, G3 = 0 */
+    float x0, y0, x1, y1;        /* diem dau, diem cuoi */
+    float i_off, j_off;          /* offset tam cung (da resolve tu R neu can) */
     float feedrate;              /* mm/min */
-    float length;                /* mm */
+    float length;                /* do dai doan (mm) */
     float tan_in_x,  tan_in_y;   /* vector tiep tuyen don vi tai diem DAU */
     float tan_out_x, tan_out_y;  /* vector tiep tuyen don vi tai diem CUOI */
     float v_entry, v_exit;       /* ket qua look-ahead (mm/s) */
 };
 
 /*
- * arc_sweep: tinh goc bat dau va goc quet cua cung tron.
- * Tach rieng vi ca build_segments() va interpolate_arc() deu can.
+ * arc_sweep: goc bat dau va goc quet cua cung tron.
+ * angle_start = goc cua diem dau nhin tu tam (atan2).
+ * sweep = goc quay tu dau den cuoi; ep dau theo chieu quay:
+ *   G2 (CW, thuan kim dong ho)  -> sweep phai AM
+ *   G3 (CCW, nguoc kim dong ho) -> sweep phai DUONG
+ * (atan2 tra ve goc trong [-pi, pi] nen hieu 2 goc co the sai dau,
+ *  phai cong/tru 2*pi de dung chieu.)
  */
 void arc_sweep(float x0, float y0, float x1, float y1,
                float cx, float cy, int clockwise,
                float *out_angle_start, float *out_sweep) {
     float angle_start = atan2f(y0 - cy, x0 - cx);
-    float angle_end   = atan2f(y1 - cy, x1 - cx);
-    float sweep = angle_end - angle_start;
-    if (clockwise) {
-        if (sweep > 0) sweep -= 2.0f * 3.14159265f;  /* phai am */
-    } else {
-        if (sweep < 0) sweep += 2.0f * 3.14159265f;  /* phai duong */
-    }
+    float sweep = atan2f(y1 - cy, x1 - cx) - angle_start;
+    if (clockwise)  { if (sweep > 0) sweep -= 2.0f * 3.14159265f; }
+    else            { if (sweep < 0) sweep += 2.0f * 3.14159265f; }
     *out_angle_start = angle_start;
     *out_sweep       = sweep;
 }
 
 /*
- * junction_velocity: van toc toi da khi qua diem noi (eq 34).
+ * arc_center_from_r: tinh offset tam (I,J) khi G-code cho ban kinh R.
  *
- * Input: 2 vector tiep tuyen don vi (ra khoi doan truoc, vao doan sau).
- * Goc alpha giua chung tinh bang dot product (eq 36):
- *   cos(alpha) = t0 . t1
+ * Co 2 duong tron ban kinh R di qua 2 diem -> 2 tam ung vien.
+ * Tam nam tren duong trung truc cua day cung, cach trung diem mot khoang
+ *   h = sqrt(R^2 - (d/2)^2)   (Pythagore, d = do dai day cung)
+ * Chon tam ben nao: quy uoc R>0 = cung nho hon 180 do, R<0 = lon hon 180 do,
+ * ket hop voi chieu quay G2/G3 (gop trong bien 'sign').
  *
- * Goc cang gat -> sin(alpha/2) cang lon -> phai di cang cham.
- * Duong gan thang (alpha ~ 0) -> khong gioi han (tra ve so rat lon,
- * se bi cap boi feedrate o buoc sau).
+ * Tra ve 0 neu hinh hoc vo ly (2 diem xa hon duong kinh 2R).
  */
+int arc_center_from_r(float x0, float y0, float x1, float y1,
+                      float r, int clockwise,
+                      float *out_i, float *out_j) {
+    float dx = x1 - x0, dy = y1 - y0;
+    float d  = sqrtf(dx*dx + dy*dy);
+    if (d < 0.001f || d > 2.0f * fabsf(r) + 0.01f) {
+        printf("  [WARN] arc geometry invalid: d=%.2f R=%.2f\n", d, fabsf(r));
+        return 0;
+    }
+    float h_sq = r*r - (d/2.0f)*(d/2.0f);
+    float h    = (h_sq > 0.0f) ? sqrtf(h_sq) : 0.0f;
+    float sign = ((r > 0) ? 1.0f : -1.0f) * (clockwise ? 1.0f : -1.0f);
+    /* (px,py) = phap tuyen don vi cua day cung (quay day cung 90 do) */
+    float px = -dy / d, py = dx / d;
+    *out_i = (x0 + x1) / 2.0f + sign * h * px - x0;
+    *out_j = (y0 + y1) / 2.0f + sign * h * py - y0;
+    return 1;
+}
+
+/* =============================================================
+   LOOK-AHEAD (Chen et al. 2013)
+   =============================================================
+
+   Khong co look-ahead: moi doan phai dung han (v=0) o hai dau -> may
+   giat cuc khi chay nhieu doan ngan. Look-ahead doc truoc toan bo duong
+   chay de tinh van toc CHO PHEP tai moi diem noi giua 2 doan, roi dam bao
+   cac van toc do dat duoc voi gia toc gioi han. 3 buoc:
+
+   1. junction_velocity (eq 34): khi re goc alpha voi toc do v, vector
+      van toc doi huong dot ngot, bien thien |dv| = 2*v*sin(alpha/2).
+      Bien thien nay phai thuc hien duoc voi gia toc a_max trong khoang
+      thoi gian T, suy ra:
+        v_junction <= a_max * T / (2*sin(alpha/2))
+      Goc cang gat -> phai qua cang cham. Duong gan thang -> khong gioi han.
+      (Hien dat JUNCTION_T = Ts = 1ms dung nhu paper: goc 90 do chi cho
+       phep 0.35 mm/s, coi nhu van dung tai goc gat -- doi lai goc sac
+       tuyet doi. Muon nhanh hon co the noi T len, goc se bi bo tron.)
+
+   2. Backward pass (cuoi -> dau): doan i phai GIAM kip tu v[i] xuong
+      v[i+1] trong do dai L[i]. Neu v[i] cao qua thi ha xuong
+        v[i] <= sqrt(v[i+1]^2 + 2*a*L[i])
+   3. Forward pass (dau -> cuoi): doan i phai TANG kip, doi xung voi (2).
+
+   Sau 2 pass, moi cap (v[i], v[i+1]) thoa |v[i+1]^2 - v[i]^2| <= 2*a*L[i]
+   nen compute_trapezoid luon dung duoc profil hop le.
+*/
 float junction_velocity(float t0x, float t0y, float t1x, float t1y) {
+    /* goc giua 2 tiep tuyen: cos(alpha) = t0 . t1 (2 vector don vi) */
     float dot = t0x*t1x + t0y*t1y;
-    if (dot >  1.0f) dot =  1.0f;   /* chong loi lam tron float */
+    if (dot >  1.0f) dot =  1.0f;   /* chong loi lam tron truoc acos */
     if (dot < -1.0f) dot = -1.0f;
     float alpha = acosf(dot);
-    if (alpha < 0.001f) return 1.0e9f;  /* gan thang: khong can giam toc */
+    if (alpha < 0.001f) return 1.0e9f;  /* gan thang: tra so lon, feedrate se cap sau */
     return MAX_ACCELERATION * JUNCTION_T / (2.0f * sinf(alpha * 0.5f));
 }
 
-/*
- * compute_lookahead: dien v_entry / v_exit cho moi doan.
- *
- * vj[i] = van toc tai diem noi giua doan i-1 va doan i.
- * vj[0] = 0 (bat dau tu dung yen), vj[n] = 0 (ket thuc dung yen).
- */
 void compute_lookahead(struct Segment *segs, int n) {
+    /* vj[i] = van toc tai diem noi TRUOC doan i.
+       vj[0] = 0 (xuat phat dung yen), vj[n] = 0 (ket thuc dung yen). */
     float vj[MAX_SEGMENTS + 1];
     float a = MAX_ACCELERATION;
     int i;
 
-    /* --- Buoc 1: junction velocity tu goc chuyen huong --- */
+    /* buoc 1: junction velocity tu goc doi huong, cap boi feedrate 2 doan ke */
     vj[0] = 0.0f;
     vj[n] = 0.0f;
     for (i = 1; i < n; i++) {
         float v = junction_velocity(segs[i-1].tan_out_x, segs[i-1].tan_out_y,
                                     segs[i].tan_in_x,    segs[i].tan_in_y);
-        /* khong vuot feedrate cua ca 2 doan lien ke (eq 35: v = min(vt, vm)) */
         float vmax_prev = segs[i-1].feedrate / 60.0f;
         float vmax_next = segs[i].feedrate   / 60.0f;
         if (v > vmax_prev) v = vmax_prev;
@@ -687,26 +389,18 @@ void compute_lookahead(struct Segment *segs, int n) {
         vj[i] = v;
     }
 
-    /* --- Buoc 2: backward pass ---
-       Di tu cuoi ve dau. Doan i phai GIAM duoc tu vj[i] xuong vj[i+1]
-       trong chieu dai L[i]. Toc do vao lon nhat cho phep:
-         v^2 = vj[i+1]^2 + 2*a*L[i]   (phuong trinh dong hoc)
-       Neu vj[i] lon hon -> ha xuong. */
+    /* buoc 2: backward pass -- dam bao giam toc kip */
     for (i = n - 1; i >= 0; i--) {
         float v_reachable = sqrtf(vj[i+1]*vj[i+1] + 2.0f * a * segs[i].length);
         if (vj[i] > v_reachable) vj[i] = v_reachable;
     }
-
-    /* --- Buoc 3: forward pass ---
-       Di tu dau ve cuoi. Doan i phai TANG duoc tu vj[i] len vj[i+1].
-       Toc do ra lon nhat dat duoc:
-         v^2 = vj[i]^2 + 2*a*L[i] */
+    /* buoc 3: forward pass -- dam bao tang toc kip */
     for (i = 0; i < n; i++) {
         float v_reachable = sqrtf(vj[i]*vj[i] + 2.0f * a * segs[i].length);
         if (vj[i+1] > v_reachable) vj[i+1] = v_reachable;
     }
 
-    /* --- Ghi ket qua vao tung doan --- */
+    /* ghi ket qua vao tung doan */
     for (i = 0; i < n; i++) {
         segs[i].v_entry = vj[i];
         segs[i].v_exit  = vj[i+1];
@@ -714,102 +408,72 @@ void compute_lookahead(struct Segment *segs, int n) {
 }
 
 /*
- * build_segments: chay qua mang GCommand, resolve toan bo hinh hoc
- * (toa do dich, tam arc, chieu dai, tiep tuyen) thanh mang Segment.
+ * build_segments: chay qua GCommand[], resolve hinh hoc thanh Segment[].
+ * Xu ly logic modal: G90/G91 (absolute/incremental), feedrate ke thua,
+ * vi tri hien tai cap nhat dan qua tung lenh.
  *
- * Logic modal (G90/G91, feedrate, vi tri hien tai) giong het vong lap
- * noi suy cu trong main() — chi khac la KHONG noi suy, chi thu thap.
- *
- * Tiep tuyen:
- *   Line: (dx, dy) / L  — giong nhau o dau va cuoi doan.
- *   Arc:  vuong goc voi ban kinh tai diem do.
- *         Vi tri tren cung: P(theta) = tam + R*(cos, sin)
- *         CCW (G3): tiep tuyen = (-sin(theta),  cos(theta))
- *         CW  (G2): tiep tuyen = ( sin(theta), -cos(theta))
+ * Tiep tuyen (dung cho look-ahead):
+ *   Line: (dx,dy)/L -- giong nhau o dau va cuoi doan.
+ *   Arc:  vuong goc voi ban kinh tai diem do. Diem tren cung la
+ *         P(theta) = tam + R*(cos theta, sin theta), dao ham theo theta:
+ *         CCW (G3): tiep tuyen = (-sin theta,  cos theta)
+ *         CW  (G2): nguoc lai  = ( sin theta, -cos theta)  (bien 'dir')
  */
-int build_segments(struct GCommand *commands, int cmd_count,
-                   struct Segment *segs) {
-    float current_x  = 0.0f;
-    float current_y  = 0.0f;
-    float feedrate   = RAPID_FEEDRATE;
-    int   coord_mode = MODE_ABSOLUTE;
-    int   n = 0;
-    int   i;
+int build_segments(struct GCommand *commands, int cmd_count, struct Segment *segs) {
+    float current_x = 0.0f, current_y = 0.0f;
+    float feedrate  = RAPID_FEEDRATE;
+    int   incremental = 0;   /* 0 = G90 absolute, 1 = G91 incremental */
+    int   n = 0, i;
 
     for (i = 0; i < cmd_count; i++) {
         struct GCommand *cmd = &commands[i];
-        int is_arc = (cmd->code[1] == '2' || cmd->code[1] == '3');
 
-        if (cmd->mode_change == 90) coord_mode = MODE_ABSOLUTE;
-        else if (cmd->mode_change == 91) coord_mode = MODE_INCREMENTAL;
+        if      (cmd->mode_change == 90) incremental = 0;
+        else if (cmd->mode_change == 91) incremental = 1;
+        if (cmd->code[0] == '\0') continue;   /* dong chi co G90/G91 */
+        if (cmd->has_f) feedrate = cmd->f;    /* feedrate modal */
 
-        if (cmd->code[0] == '\0') continue;
-
-        if (is_arc) {
-            if (cmd->data.arc.has_f)    feedrate = cmd->data.arc.f;
+        /* toa do dich: G91 cong don, G90 thay the; thieu X/Y thi giu nguyen */
+        float target_x = current_x, target_y = current_y;
+        if (incremental) {
+            if (cmd->has_x) target_x += cmd->x;
+            if (cmd->has_y) target_y += cmd->y;
         } else {
-            if (cmd->data.linear.has_f) feedrate = cmd->data.linear.f;
-        }
-
-        /* toa do dich (giong logic cu trong main) */
-        float target_x, target_y;
-        if (is_arc) {
-            if (coord_mode == MODE_INCREMENTAL) {
-                target_x = current_x + (cmd->data.arc.has_x ? cmd->data.arc.x : 0.0f);
-                target_y = current_y + (cmd->data.arc.has_y ? cmd->data.arc.y : 0.0f);
-            } else {
-                target_x = cmd->data.arc.has_x ? cmd->data.arc.x : current_x;
-                target_y = cmd->data.arc.has_y ? cmd->data.arc.y : current_y;
-            }
-        } else {
-            if (coord_mode == MODE_INCREMENTAL) {
-                target_x = current_x + (cmd->data.linear.has_x ? cmd->data.linear.x : 0.0f);
-                target_y = current_y + (cmd->data.linear.has_y ? cmd->data.linear.y : 0.0f);
-            } else {
-                target_x = cmd->data.linear.has_x ? cmd->data.linear.x : current_x;
-                target_y = cmd->data.linear.has_y ? cmd->data.linear.y : current_y;
-            }
+            if (cmd->has_x) target_x = cmd->x;
+            if (cmd->has_y) target_y = cmd->y;
         }
 
         struct Segment *s = &segs[n];
         memset(s, 0, sizeof(*s));
-        s->is_arc   = is_arc;
-        s->x0       = current_x;
-        s->y0       = current_y;
-        s->x1       = target_x;
-        s->y1       = target_y;
+        s->is_arc   = (cmd->code[1] == '2' || cmd->code[1] == '3');
+        s->x0 = current_x;  s->y0 = current_y;
+        s->x1 = target_x;   s->y1 = target_y;
         s->feedrate = feedrate;
 
-        if (is_arc) {
+        /* cap nhat vi tri ngay: neu doan bi bo qua (continue ben duoi)
+           thi vi tri van phai nhay den dich */
+        current_x = target_x;
+        current_y = target_y;
+
+        if (s->is_arc) {
             s->clockwise = (cmd->code[1] == '2');
-            float i_off = cmd->data.arc.has_i ? cmd->data.arc.i : 0.0f;
-            float j_off = cmd->data.arc.has_j ? cmd->data.arc.j : 0.0f;
-            if (cmd->data.arc.has_r) {
-                if (!arc_center_from_r(current_x, current_y, target_x, target_y,
-                                       cmd->data.arc.r, s->clockwise,
-                                       &i_off, &j_off)) {
-                    /* arc loi hinh hoc: bo qua nhu interpolate_arc cu */
-                    current_x = target_x;
-                    current_y = target_y;
-                    continue;
-                }
-            }
+            float i_off = cmd->has_i ? cmd->i : 0.0f;
+            float j_off = cmd->has_j ? cmd->j : 0.0f;
+            if (cmd->has_r &&
+                !arc_center_from_r(s->x0, s->y0, s->x1, s->y1,
+                                   cmd->r, s->clockwise, &i_off, &j_off))
+                continue;  /* arc loi hinh hoc: bo qua */
             s->i_off = i_off;
             s->j_off = j_off;
 
-            float cx = current_x + i_off;
-            float cy = current_y + j_off;
             float radius = sqrtf(i_off*i_off + j_off*j_off);
-            if (radius < 0.001f) {
-                current_x = target_x;
-                current_y = target_y;
-                continue;
-            }
+            if (radius < 0.001f) continue;  /* khong co tam hop le */
 
             float angle_start, sweep;
-            arc_sweep(current_x, current_y, target_x, target_y,
-                      cx, cy, s->clockwise, &angle_start, &sweep);
-            s->length = fabsf(sweep) * radius;
+            arc_sweep(s->x0, s->y0, s->x1, s->y1,
+                      s->x0 + i_off, s->y0 + j_off, s->clockwise,
+                      &angle_start, &sweep);
+            s->length = fabsf(sweep) * radius;  /* do dai cung = R * goc quet */
 
             float angle_end = angle_start + sweep;
             float dir = s->clockwise ? -1.0f : 1.0f;
@@ -818,15 +482,9 @@ int build_segments(struct GCommand *commands, int cmd_count,
             s->tan_out_x = dir * -sinf(angle_end);
             s->tan_out_y = dir *  cosf(angle_end);
         } else {
-            float dx = target_x - current_x;
-            float dy = target_y - current_y;
+            float dx = s->x1 - s->x0, dy = s->y1 - s->y0;
             float L  = sqrtf(dx*dx + dy*dy);
-            if (L < 0.001f) {
-                /* doan khong di chuyen (vd G90 G00 X0 Y0 tu goc): bo qua */
-                current_x = target_x;
-                current_y = target_y;
-                continue;
-            }
+            if (L < 0.001f) continue;  /* doan khong di chuyen (vd G90 G0 X0 Y0 tu goc) */
             s->length    = L;
             s->tan_in_x  = dx / L;
             s->tan_in_y  = dy / L;
@@ -834,13 +492,68 @@ int build_segments(struct GCommand *commands, int cmd_count,
             s->tan_out_y = s->tan_in_y;
         }
 
-        n++;
-        current_x = target_x;
-        current_y = target_y;
-        if (n >= MAX_SEGMENTS) break;
+        if (++n >= MAX_SEGMENTS) break;
+    }
+    return n;
+}
+
+/* =============================================================
+   INTERPOLATION
+   =============================================================
+
+   Noi suy 1 doan (thang hoac cung) theo thoi gian:
+   1. Tinh profil hinh thang cho do dai doan
+   2. Vong lap moi 1ms:
+        a. s(t), v(t) tu profil (trapezoid_state)
+        b. alpha = s / L  = phan tram quang duong da di (0..1)
+        c. doi alpha thanh toa do:
+             thang: P = P0 + alpha*(P1-P0)
+             cung:  goc = angle_start + alpha*sweep, P = tam + R*(cos,sin)
+        d. ghi CSV: t_ms, x, y, v
+   3. Ghi diem cuoi chinh xac (x1,y1) de tranh loi lam tron float
+   Tra ve thoi gian doan (ms) de main() cong don.
+*/
+float interpolate_segment(const struct Segment *seg, float t_start_ms, FILE *csv) {
+    /* hinh hoc cung: chi tinh 1 lan truoc vong lap */
+    float cx = 0, cy = 0, radius = 0, angle_start = 0, sweep = 0;
+    if (seg->is_arc) {
+        cx = seg->x0 + seg->i_off;
+        cy = seg->y0 + seg->j_off;
+        radius = sqrtf(seg->i_off*seg->i_off + seg->j_off*seg->j_off);
+        arc_sweep(seg->x0, seg->y0, seg->x1, seg->y1, cx, cy,
+                  seg->clockwise, &angle_start, &sweep);
     }
 
-    return n;
+    struct TrapezoidProfile prof = compute_trapezoid(seg->length, seg->feedrate,
+                                                     seg->v_entry, seg->v_exit);
+    float total_ms = prof.total_time * 1000.0f;
+
+    float t_ms;
+    for (t_ms = 0.0f; t_ms < total_ms; t_ms += DT_MS) {
+        float s, v, x, y;
+        trapezoid_state(t_ms / 1000.0f, &prof, &s, &v);
+
+        float alpha = s / seg->length;
+        if (alpha > 1.0f) alpha = 1.0f;
+
+        if (seg->is_arc) {
+            float angle = angle_start + alpha * sweep;
+            x = cx + radius * cosf(angle);
+            y = cy + radius * sinf(angle);
+        } else {
+            x = seg->x0 + alpha * (seg->x1 - seg->x0);
+            y = seg->y0 + alpha * (seg->y1 - seg->y0);
+        }
+        if (csv) fprintf(csv, "%.1f,%.4f,%.4f,%.3f\n", t_start_ms + t_ms, x, y, v);
+    }
+
+    /* diem cuoi chinh xac */
+    if (csv) fprintf(csv, "%.1f,%.4f,%.4f,%.3f\n",
+                     t_start_ms + total_ms, seg->x1, seg->y1, prof.v_exit);
+
+    printf("  v_entry=%.1f  v_peak=%.1f  v_exit=%.1f mm/s  |  %.0f ms\n",
+           prof.v_entry, prof.v_peak, prof.v_exit, total_ms);
+    return total_ms;
 }
 
 /* =============================================================
@@ -848,25 +561,22 @@ int build_segments(struct GCommand *commands, int cmd_count,
    ============================================================= */
 int main(int argc, char *argv[]) {
     const char *filepath = (argc > 1) ? argv[1] : "test.gcode";
-
     printf("Reading file: %s\n\n", filepath);
 
-    struct GCommand commands[100];
-    int cmd_count = read_gcode_file(filepath, commands, 100);
+    struct GCommand commands[MAX_SEGMENTS];
+    int cmd_count = read_gcode_file(filepath, commands, MAX_SEGMENTS);
     printf("Found %d commands:\n\n", cmd_count);
 
-    /* mo file CSV de ghi quy dao.
-       Format: t_ms,x,y,v
-       Moi dong = 1 diem mau (cach nhau DT_MS = 1ms). */
+    /* file CSV ket qua: moi dong 1 diem mau cach nhau DT_MS */
     FILE *csv = fopen("trajectory.csv", "w");
     if (csv) fprintf(csv, "t_ms,x,y,v\n");
 
-    /* --- Buoc 1: resolve toan bo hinh hoc thanh mang Segment --- */
+    /* buoc 1: resolve hinh hoc */
     struct Segment segments[MAX_SEGMENTS];
     int seg_count = build_segments(commands, cmd_count, segments);
     printf("Built %d motion segments\n\n", seg_count);
 
-    /* --- Buoc 2: look-ahead --- */
+    /* buoc 2: look-ahead dien v_entry/v_exit cho tung doan */
     compute_lookahead(segments, seg_count);
 
     printf("Look-ahead junction velocities (JUNCTION_T = %.0f ms):\n",
@@ -875,35 +585,16 @@ int main(int argc, char *argv[]) {
     for (i = 0; i < seg_count; i++) {
         printf("  seg %2d  %s  L=%6.2f mm  v_entry=%5.1f  v_exit=%5.1f mm/s\n",
                i + 1,
-               segments[i].is_arc ? (segments[i].clockwise ? "G2 " : "G3 ")
-                                  : "lin",
-               segments[i].length,
-               segments[i].v_entry, segments[i].v_exit);
+               segments[i].is_arc ? (segments[i].clockwise ? "G2 " : "G3 ") : "lin",
+               segments[i].length, segments[i].v_entry, segments[i].v_exit);
     }
     printf("\n");
 
-    /* --- Buoc 3: noi suy tung doan voi v_entry/v_exit da tinh --- */
-    float t_ms = 0.0f;   /* thoi gian tich luy (ms) */
+    /* buoc 3: noi suy tung doan, cong don thoi gian */
+    float t_ms = 0.0f;
     for (i = 0; i < seg_count; i++) {
-        struct Segment *s = &segments[i];
         printf("--- Segment %d:\n", i + 1);
-
-        float elapsed_ms;
-        if (s->is_arc) {
-            /* tam da resolve trong build_segments -> truyen i/j, r=0 */
-            elapsed_ms = interpolate_arc(
-                s->x0, s->y0, s->x1, s->y1,
-                s->i_off, s->j_off, 0.0f,
-                s->clockwise, s->feedrate,
-                s->v_entry, s->v_exit, t_ms, csv);
-        } else {
-            elapsed_ms = interpolate_linear(
-                s->x0, s->y0, s->x1, s->y1,
-                s->feedrate,
-                s->v_entry, s->v_exit, t_ms, csv);
-        }
-
-        t_ms += elapsed_ms;
+        t_ms += interpolate_segment(&segments[i], t_ms, csv);
     }
 
     printf("Total time: %.1f ms (%.2f sec)\n", t_ms, t_ms / 1000.0f);
@@ -911,6 +602,5 @@ int main(int argc, char *argv[]) {
         fclose(csv);
         printf("Saved: trajectory.csv  ->  python visualize.py trajectory.csv\n");
     }
-
     return 0;
 }
