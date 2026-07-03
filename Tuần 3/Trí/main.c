@@ -43,6 +43,23 @@
 #define MODE_ABSOLUTE        90
 #define MODE_INCREMENTAL     91
 
+/* ---- LOOK-AHEAD (Chen et al. 2013, eq 34) ----
+   Van toc toi da tai diem noi giua 2 doan:
+     v_junction <= a_max * T / (2 * sin(alpha/2))
+   alpha = goc giua 2 vector tiep tuyen tai diem noi.
+
+   Y nghia: khi qua goc re alpha voi toc do v, vector van toc doi huong
+   dot ngot, do bien thien |dv| = 2*v*sin(alpha/2). Bien thien nay phai
+   thuc hien duoc voi gia toc <= a_max trong khoang thoi gian T.
+
+   Dat T = Ts = 1ms dung nhu paper: toan bo cu doi huong phai xong
+   trong 1 tick -> bao thu, goc sac tuyet doi nhung qua goc gat rat
+   cham (90 do ~ 0.35 mm/s). Muon nhanh hon co the noi T len,
+   doi lai goc bi bo tron. */
+#define JUNCTION_T        0.001f  /* 1ms = Ts, giong paper */
+
+#define MAX_SEGMENTS       100
+
 /* =============================================================
    STRUCT DATA
    ============================================================= */
@@ -462,6 +479,58 @@ float interpolate_linear(float x0, float y0,
    6. Moi 1ms: tinh s(t) -> alpha -> angle = angle_start + alpha*sweep
               -> x = cx + R*cos(angle),  y = cy + R*sin(angle)
 */
+/* prototype: dinh nghia o phan LOOK-AHEAD phia duoi,
+   nhung interpolate_arc cung can dung */
+void arc_sweep(float x0, float y0, float x1, float y1,
+               float cx, float cy, int clockwise,
+               float *out_angle_start, float *out_sweep);
+
+/*
+ * arc_center_from_r: tinh offset tam (i_off, j_off) tu ban kinh R.
+ *
+ * Co 2 cung tron noi (x0,y0) va (x1,y1) voi ban kinh R.
+ * Chon cung nao tuy thuoc dau cua R va chieu quay G2/G3:
+ *   R > 0: cung nho hon 180 do
+ *   R < 0: cung lon hon 180 do
+ *
+ * Phuong phap: tam nam tren duong trung truc cua day cung,
+ * cach trung diem mot khoang h = sqrt(R^2 - (d/2)^2).
+ *
+ * Tra ve 1 neu hop le, 0 neu hinh hoc sai (d qua lon so voi R).
+ */
+int arc_center_from_r(float x0, float y0,
+                      float x1, float y1,
+                      float r, int clockwise,
+                      float *out_i, float *out_j) {
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float d  = sqrtf(dx*dx + dy*dy);  /* khoang cach hai diem */
+    if (d < 0.001f || d > 2.0f * fabsf(r) + 0.01f) {
+        printf("  [WARN] arc geometry invalid: d=%.2f R=%.2f\n", d, fabsf(r));
+        return 0;
+    }
+    float h_sq = r*r - (d/2.0f)*(d/2.0f);
+    float h    = (h_sq > 0.0f) ? sqrtf(h_sq) : 0.0f;
+    float mx   = (x0 + x1) / 2.0f;
+    float my   = (y0 + y1) / 2.0f;
+    /* vector vuong goc voi day cung (chieu quay 90 do) */
+    float px   = -dy / d;
+    float py   =  dx / d;
+    /* sign xac dinh tam o phia nao cua day cung (R>0 hay R<0) */
+    float sign = (r > 0) ? 1.0f : -1.0f;
+    float center_x, center_y;
+    if (clockwise) {
+        center_x = mx + sign * h * px;
+        center_y = my + sign * h * py;
+    } else {
+        center_x = mx - sign * h * px;
+        center_y = my - sign * h * py;
+    }
+    *out_i = center_x - x0;
+    *out_j = center_y - y0;
+    return 1;
+}
+
 float interpolate_arc(float x0, float y0,
                       float x1, float y1,
                       float i_off, float j_off,
@@ -474,35 +543,8 @@ float interpolate_arc(float x0, float y0,
 
     /* --- Tinh cx, cy tu R neu can --- */
     if (r != 0.0f) {
-        float dx = x1 - x0;
-        float dy = y1 - y0;
-        float d  = sqrtf(dx*dx + dy*dy);  /* khoang cach hai diem */
-        if (d < 0.001f || d > 2.0f * fabsf(r) + 0.01f) {
-            printf("  [WARN] arc geometry invalid: d=%.2f R=%.2f\n", d, fabsf(r));
+        if (!arc_center_from_r(x0, y0, x1, y1, r, clockwise, &i_off, &j_off))
             return 0.0f;
-        }
-        /* h = khoang cach tu trung diem day cung den tam.
-           Phuong phap: tam nam tren duong trung truc cua day cung,
-           cach trung diem mot khoang h = sqrt(R^2 - (d/2)^2). */
-        float h_sq = r*r - (d/2.0f)*(d/2.0f);
-        float h    = (h_sq > 0.0f) ? sqrtf(h_sq) : 0.0f;
-        float mx   = (x0 + x1) / 2.0f;
-        float my   = (y0 + y1) / 2.0f;
-        /* vector vuong goc voi day cung (chieu quay 90 do) */
-        float px   = -dy / d;
-        float py   =  dx / d;
-        /* sign xac dinh tam o phia nao cua day cung (R>0 hay R<0) */
-        float sign = (r > 0) ? 1.0f : -1.0f;
-        float center_x, center_y;
-        if (clockwise) {
-            center_x = mx + sign * h * px;
-            center_y = my + sign * h * py;
-        } else {
-            center_x = mx - sign * h * px;
-            center_y = my - sign * h * py;
-        }
-        i_off = center_x - x0;
-        j_off = center_y - y0;
     }
 
     float center_x   = x0 + i_off;
@@ -510,21 +552,10 @@ float interpolate_arc(float x0, float y0,
     float arc_radius  = sqrtf(i_off*i_off + j_off*j_off);
     if (arc_radius < 0.001f) return 0.0f;
 
-    /* goc bat dau va goc ket thuc (radian, -pi..pi) */
-    float angle_start = atan2f(y0 - center_y, x0 - center_x);
-    float angle_end   = atan2f(y1 - center_y, x1 - center_x);
-
-    /* tinh sweep angle (phai dung dau):
-       G2 (clockwise): sweep am.   G3 (counter-clockwise): sweep duong.
-       Dieu chinh de sweep dung chieu quay. */
-    float sweep;
-    if (clockwise) {
-        sweep = angle_end - angle_start;
-        if (sweep > 0) sweep -= 2.0f * 3.14159265f;  /* phai am */
-    } else {
-        sweep = angle_end - angle_start;
-        if (sweep < 0) sweep += 2.0f * 3.14159265f;  /* phai duong */
-    }
+    /* goc bat dau va goc quet (dau cua sweep theo chieu quay G2/G3) */
+    float angle_start, sweep;
+    arc_sweep(x0, y0, x1, y1, center_x, center_y, clockwise,
+              &angle_start, &sweep);
 
     /* do dai cung = ban kinh * goc quay (radian) */
     float arc_length = fabsf(sweep) * arc_radius;
@@ -559,55 +590,168 @@ float interpolate_arc(float x0, float y0,
 }
 
 /* =============================================================
-   MAIN
-   ============================================================= */
-int main(int argc, char *argv[]) {
-    const char *filepath = (argc > 1) ? argv[1] : "test.gcode";
+   LOOK-AHEAD (Chen et al. 2013)
+   =============================================================
 
-    printf("Reading file: %s\n\n", filepath);
+   Truoc khi noi suy, doc truoc TOAN BO cac doan de biet hinh dang
+   duong chay -> tinh van toc tai moi diem noi (junction) -> moi doan
+   khong can dung ve 0 nua.
 
-    struct GCommand commands[100];
-    int cmd_count = read_gcode_file(filepath, commands, 100);
-    printf("Found %d commands:\n\n", cmd_count);
+   3 buoc:
+     1. Tinh v_junction tai moi diem noi tu goc chuyen huong (eq 34)
+     2. Backward pass: tu cuoi ve dau, dam bao doan i GIAM kip
+        tu v[i] xuong v[i+1] trong chieu dai L[i]
+     3. Forward pass: tu dau ve cuoi, dam bao doan i TANG kip
+        tu v[i] len v[i+1] trong chieu dai L[i]
 
-    /* mo file CSV de ghi quy dao.
-       Format: t_ms,x,y,v
-       Moi dong = 1 diem mau (cach nhau DT_MS = 1ms). */
-    FILE *csv = fopen("trajectory.csv", "w");
-    if (csv) fprintf(csv, "t_ms,x,y,v\n");
+   Sau 2 pass, moi cap (v[i], v[i+1]) deu thoa man
+     |v[i+1]^2 - v[i]^2| <= 2*a*L[i]
+   nen compute_trapezoid() luon dung duoc profil hop le.
+*/
 
+/* Mot doan chuyen dong da resolve day du hinh hoc.
+   Duoc xay truoc khi noi suy de look-ahead co the "nhin" toan bo. */
+struct Segment {
+    int   is_arc;
+    int   clockwise;             /* chi co nghia khi is_arc = 1 */
+    float x0, y0, x1, y1;
+    float i_off, j_off;          /* offset tam (da resolve tu R neu can) */
+    float feedrate;              /* mm/min */
+    float length;                /* mm */
+    float tan_in_x,  tan_in_y;   /* vector tiep tuyen don vi tai diem DAU */
+    float tan_out_x, tan_out_y;  /* vector tiep tuyen don vi tai diem CUOI */
+    float v_entry, v_exit;       /* ket qua look-ahead (mm/s) */
+};
+
+/*
+ * arc_sweep: tinh goc bat dau va goc quet cua cung tron.
+ * Tach rieng vi ca build_segments() va interpolate_arc() deu can.
+ */
+void arc_sweep(float x0, float y0, float x1, float y1,
+               float cx, float cy, int clockwise,
+               float *out_angle_start, float *out_sweep) {
+    float angle_start = atan2f(y0 - cy, x0 - cx);
+    float angle_end   = atan2f(y1 - cy, x1 - cx);
+    float sweep = angle_end - angle_start;
+    if (clockwise) {
+        if (sweep > 0) sweep -= 2.0f * 3.14159265f;  /* phai am */
+    } else {
+        if (sweep < 0) sweep += 2.0f * 3.14159265f;  /* phai duong */
+    }
+    *out_angle_start = angle_start;
+    *out_sweep       = sweep;
+}
+
+/*
+ * junction_velocity: van toc toi da khi qua diem noi (eq 34).
+ *
+ * Input: 2 vector tiep tuyen don vi (ra khoi doan truoc, vao doan sau).
+ * Goc alpha giua chung tinh bang dot product (eq 36):
+ *   cos(alpha) = t0 . t1
+ *
+ * Goc cang gat -> sin(alpha/2) cang lon -> phai di cang cham.
+ * Duong gan thang (alpha ~ 0) -> khong gioi han (tra ve so rat lon,
+ * se bi cap boi feedrate o buoc sau).
+ */
+float junction_velocity(float t0x, float t0y, float t1x, float t1y) {
+    float dot = t0x*t1x + t0y*t1y;
+    if (dot >  1.0f) dot =  1.0f;   /* chong loi lam tron float */
+    if (dot < -1.0f) dot = -1.0f;
+    float alpha = acosf(dot);
+    if (alpha < 0.001f) return 1.0e9f;  /* gan thang: khong can giam toc */
+    return MAX_ACCELERATION * JUNCTION_T / (2.0f * sinf(alpha * 0.5f));
+}
+
+/*
+ * compute_lookahead: dien v_entry / v_exit cho moi doan.
+ *
+ * vj[i] = van toc tai diem noi giua doan i-1 va doan i.
+ * vj[0] = 0 (bat dau tu dung yen), vj[n] = 0 (ket thuc dung yen).
+ */
+void compute_lookahead(struct Segment *segs, int n) {
+    float vj[MAX_SEGMENTS + 1];
+    float a = MAX_ACCELERATION;
+    int i;
+
+    /* --- Buoc 1: junction velocity tu goc chuyen huong --- */
+    vj[0] = 0.0f;
+    vj[n] = 0.0f;
+    for (i = 1; i < n; i++) {
+        float v = junction_velocity(segs[i-1].tan_out_x, segs[i-1].tan_out_y,
+                                    segs[i].tan_in_x,    segs[i].tan_in_y);
+        /* khong vuot feedrate cua ca 2 doan lien ke (eq 35: v = min(vt, vm)) */
+        float vmax_prev = segs[i-1].feedrate / 60.0f;
+        float vmax_next = segs[i].feedrate   / 60.0f;
+        if (v > vmax_prev) v = vmax_prev;
+        if (v > vmax_next) v = vmax_next;
+        vj[i] = v;
+    }
+
+    /* --- Buoc 2: backward pass ---
+       Di tu cuoi ve dau. Doan i phai GIAM duoc tu vj[i] xuong vj[i+1]
+       trong chieu dai L[i]. Toc do vao lon nhat cho phep:
+         v^2 = vj[i+1]^2 + 2*a*L[i]   (phuong trinh dong hoc)
+       Neu vj[i] lon hon -> ha xuong. */
+    for (i = n - 1; i >= 0; i--) {
+        float v_reachable = sqrtf(vj[i+1]*vj[i+1] + 2.0f * a * segs[i].length);
+        if (vj[i] > v_reachable) vj[i] = v_reachable;
+    }
+
+    /* --- Buoc 3: forward pass ---
+       Di tu dau ve cuoi. Doan i phai TANG duoc tu vj[i] len vj[i+1].
+       Toc do ra lon nhat dat duoc:
+         v^2 = vj[i]^2 + 2*a*L[i] */
+    for (i = 0; i < n; i++) {
+        float v_reachable = sqrtf(vj[i]*vj[i] + 2.0f * a * segs[i].length);
+        if (vj[i+1] > v_reachable) vj[i+1] = v_reachable;
+    }
+
+    /* --- Ghi ket qua vao tung doan --- */
+    for (i = 0; i < n; i++) {
+        segs[i].v_entry = vj[i];
+        segs[i].v_exit  = vj[i+1];
+    }
+}
+
+/*
+ * build_segments: chay qua mang GCommand, resolve toan bo hinh hoc
+ * (toa do dich, tam arc, chieu dai, tiep tuyen) thanh mang Segment.
+ *
+ * Logic modal (G90/G91, feedrate, vi tri hien tai) giong het vong lap
+ * noi suy cu trong main() — chi khac la KHONG noi suy, chi thu thap.
+ *
+ * Tiep tuyen:
+ *   Line: (dx, dy) / L  — giong nhau o dau va cuoi doan.
+ *   Arc:  vuong goc voi ban kinh tai diem do.
+ *         Vi tri tren cung: P(theta) = tam + R*(cos, sin)
+ *         CCW (G3): tiep tuyen = (-sin(theta),  cos(theta))
+ *         CW  (G2): tiep tuyen = ( sin(theta), -cos(theta))
+ */
+int build_segments(struct GCommand *commands, int cmd_count,
+                   struct Segment *segs) {
     float current_x  = 0.0f;
     float current_y  = 0.0f;
-    float t_ms       = 0.0f;   /* thoi gian tich luy (ms) */
     float feedrate   = RAPID_FEEDRATE;
     int   coord_mode = MODE_ABSOLUTE;
+    int   n = 0;
+    int   i;
 
-    int i;
     for (i = 0; i < cmd_count; i++) {
         struct GCommand *cmd = &commands[i];
         int is_arc = (cmd->code[1] == '2' || cmd->code[1] == '3');
 
-        /* cap nhat coordinate mode truoc khi tinh dich */
-        if (cmd->mode_change == 90) {
-            coord_mode = MODE_ABSOLUTE;
-            printf("    [G90] -> absolute mode\n");
-        } else if (cmd->mode_change == 91) {
-            coord_mode = MODE_INCREMENTAL;
-            printf("    [G91] -> incremental mode\n");
-        }
+        if (cmd->mode_change == 90) coord_mode = MODE_ABSOLUTE;
+        else if (cmd->mode_change == 91) coord_mode = MODE_INCREMENTAL;
 
         if (cmd->code[0] == '\0') continue;
 
-        /* cap nhat feedrate neu dong nay co F */
         if (is_arc) {
             if (cmd->data.arc.has_f)    feedrate = cmd->data.arc.f;
         } else {
             if (cmd->data.linear.has_f) feedrate = cmd->data.linear.f;
         }
 
-        /* tinh toa do dich:
-           G90 (absolute):    dich = gia tri trong G-code
-           G91 (incremental): dich = vi tri hien tai + gia tri trong G-code */
+        /* toa do dich (giong logic cu trong main) */
         float target_x, target_y;
         if (is_arc) {
             if (coord_mode == MODE_INCREMENTAL) {
@@ -627,37 +771,139 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        printf("--- Command %d: ", i + 1);
-        print_command(cmd);
+        struct Segment *s = &segs[n];
+        memset(s, 0, sizeof(*s));
+        s->is_arc   = is_arc;
+        s->x0       = current_x;
+        s->y0       = current_y;
+        s->x1       = target_x;
+        s->y1       = target_y;
+        s->feedrate = feedrate;
 
-        /* noi suy doan va nhan lai thoi gian thuc hien (ms).
-           v_entry=0, v_exit=0: hien tai moi doan bat dau va ket thuc o trang thai dung.
-           Khi them look-ahead: se truyen junction velocity thay cho 0. */
-        float elapsed_ms = 0.0f;
-        if (cmd->code[1] == '2') {
-            elapsed_ms = interpolate_arc(
-                current_x, current_y, target_x, target_y,
-                cmd->data.arc.has_i ? cmd->data.arc.i : 0.0f,
-                cmd->data.arc.has_j ? cmd->data.arc.j : 0.0f,
-                cmd->data.arc.has_r ? cmd->data.arc.r : 0.0f,
-                1, feedrate, 0.0f, 0.0f, t_ms, csv);
-        } else if (cmd->code[1] == '3') {
-            elapsed_ms = interpolate_arc(
-                current_x, current_y, target_x, target_y,
-                cmd->data.arc.has_i ? cmd->data.arc.i : 0.0f,
-                cmd->data.arc.has_j ? cmd->data.arc.j : 0.0f,
-                cmd->data.arc.has_r ? cmd->data.arc.r : 0.0f,
-                0, feedrate, 0.0f, 0.0f, t_ms, csv);
+        if (is_arc) {
+            s->clockwise = (cmd->code[1] == '2');
+            float i_off = cmd->data.arc.has_i ? cmd->data.arc.i : 0.0f;
+            float j_off = cmd->data.arc.has_j ? cmd->data.arc.j : 0.0f;
+            if (cmd->data.arc.has_r) {
+                if (!arc_center_from_r(current_x, current_y, target_x, target_y,
+                                       cmd->data.arc.r, s->clockwise,
+                                       &i_off, &j_off)) {
+                    /* arc loi hinh hoc: bo qua nhu interpolate_arc cu */
+                    current_x = target_x;
+                    current_y = target_y;
+                    continue;
+                }
+            }
+            s->i_off = i_off;
+            s->j_off = j_off;
+
+            float cx = current_x + i_off;
+            float cy = current_y + j_off;
+            float radius = sqrtf(i_off*i_off + j_off*j_off);
+            if (radius < 0.001f) {
+                current_x = target_x;
+                current_y = target_y;
+                continue;
+            }
+
+            float angle_start, sweep;
+            arc_sweep(current_x, current_y, target_x, target_y,
+                      cx, cy, s->clockwise, &angle_start, &sweep);
+            s->length = fabsf(sweep) * radius;
+
+            float angle_end = angle_start + sweep;
+            float dir = s->clockwise ? -1.0f : 1.0f;
+            s->tan_in_x  = dir * -sinf(angle_start);
+            s->tan_in_y  = dir *  cosf(angle_start);
+            s->tan_out_x = dir * -sinf(angle_end);
+            s->tan_out_y = dir *  cosf(angle_end);
         } else {
-            elapsed_ms = interpolate_linear(
-                current_x, current_y, target_x, target_y,
-                feedrate, 0.0f, 0.0f, t_ms, csv);
+            float dx = target_x - current_x;
+            float dy = target_y - current_y;
+            float L  = sqrtf(dx*dx + dy*dy);
+            if (L < 0.001f) {
+                /* doan khong di chuyen (vd G90 G00 X0 Y0 tu goc): bo qua */
+                current_x = target_x;
+                current_y = target_y;
+                continue;
+            }
+            s->length    = L;
+            s->tan_in_x  = dx / L;
+            s->tan_in_y  = dy / L;
+            s->tan_out_x = s->tan_in_x;
+            s->tan_out_y = s->tan_in_y;
         }
 
-        t_ms      += elapsed_ms;
-        current_x  = target_x;
-        current_y  = target_y;
-        printf("\n");
+        n++;
+        current_x = target_x;
+        current_y = target_y;
+        if (n >= MAX_SEGMENTS) break;
+    }
+
+    return n;
+}
+
+/* =============================================================
+   MAIN
+   ============================================================= */
+int main(int argc, char *argv[]) {
+    const char *filepath = (argc > 1) ? argv[1] : "test.gcode";
+
+    printf("Reading file: %s\n\n", filepath);
+
+    struct GCommand commands[100];
+    int cmd_count = read_gcode_file(filepath, commands, 100);
+    printf("Found %d commands:\n\n", cmd_count);
+
+    /* mo file CSV de ghi quy dao.
+       Format: t_ms,x,y,v
+       Moi dong = 1 diem mau (cach nhau DT_MS = 1ms). */
+    FILE *csv = fopen("trajectory.csv", "w");
+    if (csv) fprintf(csv, "t_ms,x,y,v\n");
+
+    /* --- Buoc 1: resolve toan bo hinh hoc thanh mang Segment --- */
+    struct Segment segments[MAX_SEGMENTS];
+    int seg_count = build_segments(commands, cmd_count, segments);
+    printf("Built %d motion segments\n\n", seg_count);
+
+    /* --- Buoc 2: look-ahead --- */
+    compute_lookahead(segments, seg_count);
+
+    printf("Look-ahead junction velocities (JUNCTION_T = %.0f ms):\n",
+           JUNCTION_T * 1000.0f);
+    int i;
+    for (i = 0; i < seg_count; i++) {
+        printf("  seg %2d  %s  L=%6.2f mm  v_entry=%5.1f  v_exit=%5.1f mm/s\n",
+               i + 1,
+               segments[i].is_arc ? (segments[i].clockwise ? "G2 " : "G3 ")
+                                  : "lin",
+               segments[i].length,
+               segments[i].v_entry, segments[i].v_exit);
+    }
+    printf("\n");
+
+    /* --- Buoc 3: noi suy tung doan voi v_entry/v_exit da tinh --- */
+    float t_ms = 0.0f;   /* thoi gian tich luy (ms) */
+    for (i = 0; i < seg_count; i++) {
+        struct Segment *s = &segments[i];
+        printf("--- Segment %d:\n", i + 1);
+
+        float elapsed_ms;
+        if (s->is_arc) {
+            /* tam da resolve trong build_segments -> truyen i/j, r=0 */
+            elapsed_ms = interpolate_arc(
+                s->x0, s->y0, s->x1, s->y1,
+                s->i_off, s->j_off, 0.0f,
+                s->clockwise, s->feedrate,
+                s->v_entry, s->v_exit, t_ms, csv);
+        } else {
+            elapsed_ms = interpolate_linear(
+                s->x0, s->y0, s->x1, s->y1,
+                s->feedrate,
+                s->v_entry, s->v_exit, t_ms, csv);
+        }
+
+        t_ms += elapsed_ms;
     }
 
     printf("Total time: %.1f ms (%.2f sec)\n", t_ms, t_ms / 1000.0f);
