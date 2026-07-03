@@ -1,7 +1,6 @@
 /*
  * =============================================================
  * GCode Trajectory Calculator -- Trapezoid Velocity + Look-ahead
- * (ban rut gon cua main.c -- output giong het tung byte)
  * =============================================================
  *
  * LUONG XU LY:
