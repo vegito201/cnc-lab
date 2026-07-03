@@ -1,7 +1,6 @@
 /*
  * =============================================================
  * GCode Trajectory Calculator -- Trapezoid Velocity + Look-ahead
- * (ban rut gon cua main.c -- output giong het tung byte)
  * =============================================================
  *
  * LUONG XU LY:
@@ -279,6 +278,7 @@ struct Segment {
     float length;                /* do dai doan (mm) */
     float tan_in_x,  tan_in_y;   /* vector tiep tuyen don vi tai diem DAU */
     float tan_out_x, tan_out_y;  /* vector tiep tuyen don vi tai diem CUOI */
+    float corner_r;              /* ban kinh bo goc tai DIEM CUOI doan (0 = khong bo) */
     float v_entry, v_exit;       /* ket qua look-ahead (mm/s) */
 };
 
@@ -486,6 +486,7 @@ int build_segments(struct GCommand *commands, int cmd_count, struct Segment *seg
             float L  = sqrtf(dx*dx + dy*dy);
             if (L < 0.001f) continue;  /* doan khong di chuyen (vd G90 G0 X0 Y0 tu goc) */
             s->length    = L;
+            s->corner_r  = cmd->has_r ? fabsf(cmd->r) : 0.0f;
             s->tan_in_x  = dx / L;
             s->tan_in_y  = dy / L;
             s->tan_out_x = s->tan_in_x;
@@ -493,6 +494,98 @@ int build_segments(struct GCommand *commands, int cmd_count, struct Segment *seg
         }
 
         if (++n >= MAX_SEGMENTS) break;
+    }
+    return n;
+}
+
+/* =============================================================
+   CORNER ROUNDING (bo goc bang cung tron)
+   =============================================================
+
+   Cu phap kieu Fanuc: "G01 X.. Y.. R8" -> goc tai DIEM CUOI cua doan
+   nay duoc bo tron ban kinh 8mm. Vi du trong sach CNC Programming
+   Tutorials (Thanh Tran, trang 13): R8/R10 tai P1, P2, P10, P13.
+
+   Hinh hoc: goc tai dinh P giua 2 doan thang, huong vao u, huong ra w,
+   goc doi huong alpha (cos alpha = u.w nhu eq 36). Cung tron ban kinh R
+   tiep xuc ca 2 canh, hai tiep diem cach P mot doan:
+       d = R * tan(alpha/2)
+   Doan truoc bi cat ngan d o cuoi, doan sau cat ngan d o dau,
+   chen 1 segment cung tron (dai R*alpha) vao giua.
+
+   Loi ich voi look-ahead: 2 diem noi moi (thang->cung, cung->thang)
+   co tiep tuyen LIEN TUC (alpha = 0) -> junction_velocity() tra ve
+   "khong gioi han" -> dao giu nguyen toc do qua goc thay vi phai
+   giam gan ve 0 nhu goc nhon. Luu y gia toc huong tam v^2/R phai
+   <= a_max: voi R8, v=50 -> 312 mm/s^2 < 500, on (chua enforce
+   trong code, ghi nhan viec tuong lai).
+*/
+int apply_corner_rounding(struct Segment *segs, int n) {
+    int i;
+    for (i = 0; i + 1 < n; i++) {
+        struct Segment *a = &segs[i];
+        float r = a->corner_r;
+        if (r <= 0.0f || a->is_arc || segs[i+1].is_arc) continue;
+        if (n >= MAX_SEGMENTS) break;
+
+        /* goc doi huong tai dinh goc (nhu junction_velocity) */
+        float ux = a->tan_out_x,      uy = a->tan_out_y;
+        float wx = segs[i+1].tan_in_x, wy = segs[i+1].tan_in_y;
+        float dot = ux*wx + uy*wy;
+        if (dot >  1.0f) dot =  1.0f;
+        if (dot < -1.0f) dot = -1.0f;
+        float alpha = acosf(dot);
+        if (alpha < 0.01f) continue;   /* gan thang: khong co goc de bo */
+
+        /* tiep diem cach dinh d = R*tan(alpha/2); phai vua trong 2 doan */
+        float d = r * tanf(alpha * 0.5f);
+        if (d > 0.9f * a->length || d > 0.9f * segs[i+1].length) {
+            printf("  [WARN] bo goc R%.1f khong du cho (d=%.2f mm), giu goc nhon\n", r, d);
+            continue;
+        }
+
+        float px = a->x1, py = a->y1;               /* dinh goc cu */
+        float ax = px - ux * d, ay = py - uy * d;   /* tiep diem VAO cung */
+        float bx = px + wx * d, by = py + wy * d;   /* tiep diem RA cung */
+
+        /* chieu quay: cross > 0 = re trai = CCW (G3), cross < 0 = CW (G2) */
+        float cross = ux*wy - uy*wx;
+        int cw = (cross < 0.0f);
+        /* tam = tiep diem vao + R * phap tuyen (phap tuyen huong ve phia re) */
+        float nx = cw ? uy : -uy;
+        float ny = cw ? -ux : ux;
+        float cx = ax + r * nx, cy = ay + r * ny;
+
+        /* don cho trong mang: day cac doan tu i+1 lui 1 vi tri */
+        memmove(&segs[i+2], &segs[i+1], (size_t)(n - i - 1) * sizeof(*segs));
+        n++;
+
+        /* cat ngan doan truoc (giu tangent) */
+        a->x1 = ax;  a->y1 = ay;
+        a->length  -= d;
+        a->corner_r = 0.0f;
+
+        /* cat ngan doan sau */
+        segs[i+2].x0 = bx;  segs[i+2].y0 = by;
+        segs[i+2].length -= d;
+
+        /* chen cung tron tiep tuyen lien tuc 2 dau */
+        struct Segment *arc = &segs[i+1];
+        memset(arc, 0, sizeof(*arc));
+        arc->is_arc    = 1;
+        arc->clockwise = cw;
+        arc->x0 = ax;  arc->y0 = ay;
+        arc->x1 = bx;  arc->y1 = by;
+        arc->i_off = cx - ax;
+        arc->j_off = cy - ay;
+        arc->feedrate  = a->feedrate;
+        arc->length    = r * alpha;
+        arc->tan_in_x  = ux;  arc->tan_in_y  = uy;
+        arc->tan_out_x = wx;  arc->tan_out_y = wy;
+
+        printf("  bo goc R%.1f tai (%.2f, %.2f): cung %s dai %.2f mm\n",
+               r, px, py, cw ? "G2" : "G3", arc->length);
+        i++;   /* nhay qua cung vua chen */
     }
     return n;
 }
@@ -574,7 +667,11 @@ int main(int argc, char *argv[]) {
     /* buoc 1: resolve hinh hoc */
     struct Segment segments[MAX_SEGMENTS];
     int seg_count = build_segments(commands, cmd_count, segments);
-    printf("Built %d motion segments\n\n", seg_count);
+    printf("Built %d motion segments\n", seg_count);
+
+    /* bo goc: chen cung tron tai cac goc co R tren lenh G01 */
+    seg_count = apply_corner_rounding(segments, seg_count);
+    printf("After corner rounding: %d segments\n\n", seg_count);
 
     /* buoc 2: look-ahead dien v_entry/v_exit cho tung doan */
     compute_lookahead(segments, seg_count);
