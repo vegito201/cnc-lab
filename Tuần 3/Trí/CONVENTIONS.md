@@ -19,6 +19,13 @@
 
 ## 2. Đặt tên
 
+- **Code bám paper thì KÝ HIỆU ĐẶT THEO PAPER** (T1..T7, v_start, v_m, v_end, A, D, J
+  — như Figure 1 của Chen 2013) và comment phải GHI SỐ CÔNG THỨC: `eq (1)`, `eq (8)`,
+  `eq (17)`... để dò ngược về bài báo được. Khác paper chỗ nào (vd tick → thời gian
+  liên tục) thì khai ngay đầu section.
+- Biến binary search không đặt lo/hi — đặt theo nghĩa: `v_dat` (đã biết chắc đạt),
+  `v_truot` (đã biết chắc vượt), `v_thu` (đang thử).
+
 - Hằng số ALLCAPS, tên đầy đủ dễ đọc: MAX_ACCELERATION (không phải ACCEL_MM_S2).
 - Biến/field mang nghĩa vật lý + đơn vị ghi trong comment: v_entry, v_peak, v_exit
   (mm/s); t_accel, t_cruise (s); angle_start, sweep (rad).
