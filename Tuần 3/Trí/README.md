@@ -6,16 +6,14 @@ Mô phỏng điều khiển chuyển động CNC: parser G-code + S-curve veloci
 
 - `main.c` — parser G-code + S-curve velocity profile + look-ahead (Chen et al. 2013)
 - `visualize.py` — vẽ quỹ đạo XY, position, velocity profile từ `trajectory.csv`
-- `test.gcode`, `test_g9091.gcode` — file test
-- `CONTEXT_WEEK3.md` — ghi chú context cho session làm việc
-- `IMPLEMENTATION_VS_PAPER.md` — đối chiếu code với paper Chen 2013
-- `*.pdf` — tài liệu tham khảo (paper Chen 2013, Fang 2019, sách CNC Programming Tutorials)
+- `test.gcode` — file test
+- `*.pdf`, `*.docx` — tài liệu tham khảo (paper Chen 2013, sách CNC Programming Tutorials, CNC Motion Control Theory)
 
 ## Build & chạy
 
 ```bash
 gcc main.c -o main -lm
-./main test_g9091.gcode              # -> trajectory.csv
+./main test.gcode                    # -> trajectory.csv
 python visualize.py trajectory.csv   # -> trajectory_plot.png
 ```
 
