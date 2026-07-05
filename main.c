@@ -1,6 +1,6 @@
 /*
  * =============================================================
- * GCode Trajectory Calculator -- Trapezoid Velocity + Look-ahead
+ * GCode Trajectory Calculator -- S-curve Velocity + Look-ahead
  * =============================================================
  *
  * LUONG XU LY:
@@ -35,6 +35,12 @@
 
 /* Feedrate khoi tao (mm/min). 3000 mm/min = 50 mm/s. */
 #define RAPID_FEEDRATE   3000.0f
+
+/* Jerk toi da (mm/s^3) -- toc do bien thien cua gia toc (S-curve).
+   Nho -> gia toc len/xuong tu tu, cuc em nhung cham.
+   Lon -> tien ve trapezoid (gia toc nhay bac).
+   Voi a=500: thoi gian keo gia toc tu 0 len max = a/J = 0.1s. */
+#define MAX_JERK         5000.0f
 
 /* Buoc thoi gian noi suy: 1ms = 1 diem CSV.
    Tren phan cung thuc te day la chu ky ngat cua Interpolator ISR. */
