@@ -448,7 +448,7 @@ int arc_center_from_r(float x0, float y0, float x1, float y1,
       v[i+1] trong do dai L[i]. Neu v[i] cao qua thi ha xuong muc voi toi.
    3. Forward pass (dau -> cuoi): doan i phai TANG kip, doi xung voi (2).
 
-   "Voi toi" voi trapezoid la cong thuc dong sqrt(v0^2 + 2*a*L).
+  voi trapezoid la cong thuc dong sqrt(v0^2 + 2*a*L).
    Voi S-curve thi doi van toc CAN NHIEU QUANG DUONG HON (mat them
    thoi gian keo gia toc len/xuong) va khong co cong thuc dong --
    scurve_reach() binary search tren make_ramp().dist (don dieu).
