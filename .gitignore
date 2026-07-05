@@ -1,0 +1,14 @@
+# Build artifacts
+*.exe
+*.o
+Tuần 3/Trí/main
+Tuần 3/Trí/main_test
+tempCodeRunnerFile.c
+# Generated output
+trajectory.csv
+# Tools
+.codegraph/
+# Khong track Tuan 1, Tuan 2
+Tuần 1/
+Tuần 2/
+Tuần 3/Tài liệu không có tiêu đề.docx
