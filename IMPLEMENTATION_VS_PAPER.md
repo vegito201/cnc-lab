@@ -68,3 +68,35 @@ spec là dung sai góc δ (mm, đo được): v² = a_max·δ·sin(α/2)/(1−si
 - Đường nhiều đoạn ngắn gần thẳng hàng (CAD/CAM xấp xỉ curve) sẽ gain lớn hơn nhiều.
 - Verify: v ≤ 50 mm/s, về đúng (0,0), bước max 0.05mm/sample, không NaN,
   v(t) chỉ chạm 0 ở đầu/cuối chương trình.
+
+## 6. Cập nhật: S-curve 7 pha ĐÃ implement (thay trapezoid)
+
+Profile 3 pha trapezoid đã được thay bằng S-curve 7 pha jerk-limited
+(`make_ramp` + `ramp_state` + `compute_scurve` + `scurve_state`), MAX_JERK = 5000 mm/s³.
+
+Cách làm so với paper:
+
+1. **Section 2.1 (7 pha):** lấy đúng cấu trúc 7 pha. Mỗi ramp (pha 1-3 hoặc 5-7)
+   đối xứng theo thời gian nên s_ramp = (v0+v1)/2·T — dùng làm khối xây dựng duy nhất.
+   Pha giảm tốc là ramp tăng tốc v_exit→v_peak **phát ngược thời gian** (1 hàm dùng 2 chiều).
+2. **Section 2.2 (7 type profile theo L):** KHÔNG chia case. Tận dụng tính đơn điệu
+   (v_peak cao hơn → 2 ramp dài hơn) để **binary search v_peak** — type nào thì pha
+   tương ứng tự động có thời gian 0. Đơn giản hơn nhiều, cái giá là ~48 vòng lặp/đoạn
+   (không đáng kể trong mô phỏng; firmware thật có thể cần công thức đóng của paper).
+3. **Section 2.1.1–2.1.4 (tick nguyên n_a, n_b, n_c, chỉnh v/J khử sai số làm tròn):**
+   vẫn bỏ qua — mô phỏng chạy thời gian liên tục float, cuối đoạn ghi thẳng điểm đích.
+4. **Look-ahead passes:** điều kiện khả thi v² = v0² + 2aL của trapezoid KHÔNG còn đúng
+   (đổi vận tốc giờ tốn thêm quãng đường kéo gia tốc lên/xuống). Thay bằng
+   `scurve_reach(v0, L)`: binary search trên make_ramp().dist, cận trên = công thức trapezoid.
+5. **Junction (eq 34):** giữ nguyên. Lưu ý cú đổi hướng tại junction vẫn gói trong 1 tick
+   → jerk KHÔNG bị giới hạn tại junction (giống giả định của paper); jerk chỉ được
+   đảm bảo ≤ J bên trong mỗi đoạn.
+
+Kết quả đo (test_g9091.gcode, JUNCTION_T = 1ms):
+
+- Trapezoid + look-ahead: 9822 ms → S-curve + look-ahead: **10208.9 ms** (+3.9%)
+  — cái giá của jerk hữu hạn (mỗi ramp chậm thêm ~A/J = 0.1s so với trapezoid).
+- Verify từ trajectory.csv: |a| ≤ 499 mm/s² ✓, v ≤ 50 mm/s ✓, về đúng (0,0) ✓,
+  không NaN ✓, v chỉ ~0 ở đầu/cuối chương trình ✓, jerk trong lòng đoạn ≤ J
+  (sai phân có nhiễu lượng tử do CSV in v 3 chữ số; mọi spike >8000 đều nằm
+  trong ±3ms quanh 17 junction — đúng ghi chú mục 5 ở trên) ✓.

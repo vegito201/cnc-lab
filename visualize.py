@@ -79,7 +79,7 @@ def plot(points, csv_path):
     # ── Subplot 3: velocity profile v(t) ──
     ax3 = axes[2]
     ax3.grid(True, linestyle=':', alpha=0.4)
-    ax3.set_title('Velocity Profile v(t) - Trapezoidal', fontsize=13)
+    ax3.set_title('Velocity Profile v(t) - S-curve', fontsize=13)
     ax3.set_xlabel('Time (ms)')
     ax3.set_ylabel('Velocity (mm/s)')
 

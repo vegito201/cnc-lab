@@ -2,8 +2,7 @@
 
 ## Tổng quan project
 Dự án CNC 6 trục — viết phần mềm mô phỏng điều khiển bằng C + Python.
-- **Folder chính:** `D:\02.personal\cnc-lab\Tuần 3\Trí\`
-- **Repo:** `D:\02.personal\cnc-lab\` (git)
+- **Folder chính = repo:** `D:\02.personal\cnc-lab\` (code nằm ngay gốc repo; Tuần 1/2/3 chỉ còn trên máy, không track git)
 
 ---
 
@@ -16,20 +15,26 @@ Dự án CNC 6 trục — viết phần mềm mô phỏng điều khiển bằng
 
 **Cấu trúc:**
 ```
-Constants:        MAX_ACCELERATION=500 mm/s², RAPID_FEEDRATE=3000 mm/min, DT_MS=1ms
-Structs:          GCommand (union LinearCmd/ArcCmd), TrapezoidProfile
-parse_line()      → đọc 1 dòng G-code: xử lý N number, comment, modal G-code, G90/G91
+Constants:        MAX_ACCELERATION=500 mm/s², MAX_JERK=5000 mm/s³,
+                  RAPID_FEEDRATE=3000 mm/min, DT_MS=1ms, JUNCTION_T=1ms
+Structs:          GCommand, Ramp, SCurveProfile, Segment
+parse_line()      → đọc 1 dòng G-code: N number, comment, modal G-code, G90/G91
 read_gcode_file() → đọc toàn bộ file → mảng GCommand[]
-compute_trapezoid() → tính profil hình thang (v_entry, v_peak, v_exit, t_accel, t_cruise, t_decel)
-trapezoid_state() → tại thời điểm t, trả về s(mm) và v(mm/s) bằng công thức analytic
-interpolate_linear() → nội suy đường thẳng, ghi CSV mỗi 1ms, return total_ms
-interpolate_arc()    → nội suy cung tròn (hỗ trợ I,J và R), ghi CSV, return total_ms
-main()            → đọc file, loop qua commands, gọi interpolate_*(), ghi trajectory.csv
+make_ramp()       → 1 đoạn tăng tốc jerk-limited v_low→v_high (A, t_j, t_c, T, dist)
+ramp_state()      → s(t), v(t) trong ramp bằng công thức analytic (tích phân jerk)
+compute_scurve()  → profil S-curve 7 pha: binary search v_peak (ramp lên + đều + ramp xuống)
+scurve_state()    → s(t), v(t) toàn profil; pha giảm tốc = ramp phát ngược thời gian
+scurve_reach()    → v cao nhất đạt được từ v0 sau quãng đường L (dùng trong look-ahead)
+junction_velocity() / compute_lookahead() → eq 34/35/36 Chen 2013 + backward/forward pass
+build_segments()  → resolve hình học (tọa độ, tâm arc, tiếp tuyến, độ dài)
+apply_corner_rounding() → bo góc bằng cung tròn khi G01 có R (kiểu Fanuc)
+interpolate_segment() → nội suy thẳng/cung theo thời gian, ghi CSV mỗi 1ms
+main()            → đọc file → build_segments → corner rounding → look-ahead → nội suy
 ```
 
 **Trạng thái hiện tại:**
-- Đã implement Trapezoidal Velocity Profile hoàn chỉnh
-- v_entry=0, v_exit=0 cho mọi đoạn (chưa có look-ahead)
+- Đã implement: trapezoid → look-ahead (Chen 2013) → corner rounding → **S-curve 7 pha (jerk-limited)**
+- Look-ahead dùng scurve_reach() (điều kiện 2aL của trapezoid không còn đúng khi có jerk)
 - Comment chi tiết tiếng Việt (không dấu) trong toàn bộ file
 
 ### `visualize.py` — Python visualizer
@@ -66,8 +71,11 @@ N180 X0 Y0
 - **Trapezoidal** (hiện tại): 3 pha: tăng tốc / di đều / giảm tốc
   - Công thức v_peak khi đoạn ngắn: `v_peak = sqrt(a*s + (v_entry² + v_exit²)/2)`
   - Dùng analytic formula (không numerical integration) để tránh lỗi tích lũy
-- **S-curve** (tương lai): 7 pha, giới hạn jerk J (m/s³), mượt hơn
-- **Look-ahead** (bước tiếp theo): tính junction velocity, 2-pass forward+backward
+- **S-curve** (hiện tại): 7 pha, giới hạn jerk J=5000 mm/s³. Mỗi ramp đối xứng:
+  T = Δv/A + A/J (đủ chỗ đạt A) hoặc T = 2√(Δv/J) (tam giác gia tốc),
+  s_ramp = (v0+v1)/2·T. Không có công thức đóng cho v_peak → binary search
+  (thay cho việc chia 7 type theo L như paper section 2.2)
+- **Look-ahead** (đã xong): junction velocity + 2-pass, điều kiện khả thi bằng scurve_reach()
 
 ### Look-ahead — đã nghiên cứu (paper Chen et al. 2013)
 Công thức junction velocity (eq 34):
@@ -120,32 +128,16 @@ cos(α) = τ_i · τ_{i+1} / (|τ_i| * |τ_{i+1}|)
 
 ---
 
-## Bước tiếp theo: Look-Ahead
+## Bước tiếp theo (gợi ý)
 
-Thêm vào `main()` một bước pre-process trước khi gọi interpolate_*():
+- Enforce gia tốc hướng tâm v²/R ≤ a_max trên cung tròn (đã ghi chú trong apply_corner_rounding)
+- Junction deviation kiểu GRBL thay cho JUNCTION_T (spec bằng dung sai hình học δ)
+- Trục Z / 3D, feed override, hoặc xuất step/dir giả lập
 
-```c
-// Arrays cần thêm:
-float v_entry[100];   // van toc vao cua moi doan
-float v_exit[100];    // van toc ra cua moi doan
-float junction_v[101]; // van toc tai moi junction (0..n)
-
-// Buoc 1: tinh junction velocity tu goc chuyen huong
-// Buoc 2: backward pass
-// Buoc 3: forward pass
-// Buoc 4: goi interpolate_*() voi v_entry/v_exit da tinh
+## Output hiện tại (verified working, S-curve + look-ahead, JUNCTION_T=1ms)
 ```
-
-Cần thêm helper:
-- `segment_tangent()` — vector tiep tuyen cuoi doan (line: (dx,dy)/|d|, arc: tiep tuyen tai end point)
-- `junction_velocity()` — tinh v_junction tu 2 tangent vectors va a_max
-
----
-
-## Output hiện tại (verified working)
-```
-9865 points | Total time: 9843.1 ms (9.84 s)
-X: [-50.00, 70.00] mm
+10239 points | Total time: 10208.9 ms (10.21 s)
+X: [-50.00, 70.00] mm   (trapezoid thuần: 9843ms; trapezoid+look-ahead: 9822ms)
 Y: [-20.00, 50.00] mm
 v_max = 50.00 mm/s (3000 mm/min)
 ```

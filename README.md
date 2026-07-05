@@ -1,18 +1,25 @@
-﻿# CNC Lab — Dự án CNC 6 Trục
+# CNC Lab — Dự án CNC 6 Trục
+
+Mô phỏng điều khiển chuyển động CNC: parser G-code + S-curve velocity profile + look-ahead (C), visualize quỹ đạo (Python).
 
 ## Cấu trúc
 
-- Tuần 1: Slides báo cáo (20260406_CaoTuanMinh.pptx)
-- Tuần 2: Báo cáo + tài liệu G-code
-- Tuần 3: Code C parser G-code (main.c), file test.gcode, báo cáo
+- `main.c` — parser G-code + S-curve velocity profile + look-ahead (Chen et al. 2013)
+- `visualize.py` — vẽ quỹ đạo XY, position, velocity profile từ `trajectory.csv`
+- `test.gcode`, `test_g9091.gcode` — file test
+- `CONTEXT_WEEK3.md` — ghi chú context cho session làm việc
+- `IMPLEMENTATION_VS_PAPER.md` — đối chiếu code với paper Chen 2013
+- `*.pdf` — tài liệu tham khảo (paper Chen 2013, Fang 2019, sách CNC Programming Tutorials)
+
+## Build & chạy
+
+```bash
+gcc main.c -o main -lm
+./main test_g9091.gcode              # -> trajectory.csv
+python visualize.py trajectory.csv   # -> trajectory_plot.png
+```
 
 ## Thành viên
 
 - Cao Tuấn Minh
 - Hoàng Trọng Trí
-
-## Mục đích
-
-- C — parser G-code
-- Python — mô phỏng quỹ đạo
-- G-code — ngôn ngữ điều khiển CNC
