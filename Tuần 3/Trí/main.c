@@ -239,10 +239,10 @@ void solve_zone(float dv, float *out_T_jerk, float *out_T_const, float *out_A) {
 }
 
 /*
- * zone_dist: quang duong di het 1 vung tang/giam toc tu v_thap den v_cao.
+ * zone_dist: quang duong di het 1 vung tang/giam toc tu v_low den v_high.
  * Profil gia toc doi xung theo thoi gian nen van toc trung binh cua vung
- * = (v_thap + v_cao)/2, suy ra:
- *     L_vung = (v_thap + v_cao)/2 * (T1 + T2 + T3)
+ * = (v_low + v_high)/2, suy ra:
+ *     L_vung = (v_low + v_high)/2 * (T1 + T2 + T3)
  * Day chinh la tung so hang cua eq (8):
  *     2L = (2+k)*((v_start+v_m)*na + (v_end+v_m)*nb)*Ts + 2*v_m*nc*Ts
  * trong do (2+k)*na*Ts = T1+T2+T3 la thoi gian ca vung.
@@ -250,10 +250,10 @@ void solve_zone(float dv, float *out_T_jerk, float *out_T_const, float *out_A) {
  * VI DU SO THAT (tiep vi du solve_zone): 0 -> 50 mm/s het 0.2s
  *   -> L_vung = (0+50)/2 * 0.2 = 5 mm  (trapezoid: 2.5mm)
  */
-float zone_dist(float v_thap, float v_cao) {
+float zone_dist(float v_low, float v_high) {
     float T_jerk, T_const, A;
-    solve_zone(v_cao - v_thap, &T_jerk, &T_const, &A);
-    return 0.5f * (v_thap + v_cao) * (2.0f * T_jerk + T_const);
+    solve_zone(v_high - v_low, &T_jerk, &T_const, &A);
+    return 0.5f * (v_low + v_high) * (2.0f * T_jerk + T_const);
 }
 
 /* Profil S-curve day du cua 1 doan. Ngoai T1..T7 con luu san "bang bien":
@@ -263,10 +263,10 @@ struct SCurveProfile {
     float v_start, v_m, v_end;          /* van toc dau / dinh / cuoi (mm/s) */
     float T1, T2, T3, T4, T5, T6, T7;   /* thoi gian 7 vung (s) */
     float A, D;                         /* gia toc dinh vung tang / giam (mm/s^2) */
-    float t_bien[8];                    /* t_bien[r] = thoi diem cuoi vung r (t_bien[0]=0) */
-    float v_bien[8];                    /* van toc tai cuoi vung r (mm/s) */
-    float s_bien[8];                    /* quang duong tich luy den cuoi vung r (mm) */
-    float total_time;                   /* = t_bien[7] (s) */
+    float t_bound[8];                    /* t_bound[r] = thoi diem cuoi vung r (t_bound[0]=0) */
+    float v_bound[8];                    /* van toc tai cuoi vung r (mm/s) */
+    float s_bound[8];                    /* quang duong tich luy den cuoi vung r (mm) */
+    float total_time;                   /* = t_bound[7] (s) */
 };
 
 /*
@@ -281,9 +281,9 @@ struct SCurveProfile {
  * Type nao thi vung tuong ung tu dong = 0 (Type 2: T4=0; Type 3: T2=T6=T4=0; ...)
  *
  * Ten bien binary search:
- *   v_dat  : gia tri v_m DA BIET CHAC vua trong L (ket qua nam o day)
- *   v_truot: gia tri v_m DA BIET CHAC doi hoi nhieu hon L
- *   moi vong thu diem giua, thu hep khoang [v_dat, v_truot] con mot nua;
+ *   v_feasible : gia tri v_m DA BIET CHAC vua trong L (ket qua nam o day)
+ *   v_too_high : gia tri v_m DA BIET CHAC doi hoi nhieu hon L
+ *   moi vong thu diem giua, thu hep khoang [v_feasible, v_too_high] con mot nua;
  *   48 vong -> sai so ~ v_max/2^48, duoi do phan giai float.
  *
  * VI DU SO THAT: doan 50mm, F3000 (v_max = 50mm/s), v_start = v_end = 0:
@@ -305,24 +305,24 @@ struct SCurveProfile compute_scurve(float L, float feedrate,
     if (v_end   > v_max) v_end   = v_max;
 
     /* tim v_m: binary search dieu kien eq (8) nhu mo ta o tren */
-    float v_dat   = (v_start > v_end) ? v_start : v_end;
-    float v_truot = v_max;
+    float v_feasible   = (v_start > v_end) ? v_start : v_end;
+    float v_too_high = v_max;
     if (zone_dist(v_start, v_max) + zone_dist(v_end, v_max) <= L) {
-        v_dat = v_max;   /* doan du dai de dat feedrate (Type 1) */
+        v_feasible = v_max;   /* doan du dai de dat feedrate (Type 1) */
     } else {
         for (k = 0; k < 48; k++) {
-            float v_thu = 0.5f * (v_dat + v_truot);
-            if (zone_dist(v_start, v_thu) + zone_dist(v_end, v_thu) <= L)
-                v_dat = v_thu;
+            float v_try = 0.5f * (v_feasible + v_too_high);
+            if (zone_dist(v_start, v_try) + zone_dist(v_end, v_try) <= L)
+                v_feasible = v_try;
             else
-                v_truot = v_thu;
+                v_too_high = v_try;
         }
         /* neu ngay ca v_m = max(v_start,v_end) cung khong vua thi look-ahead
            da sai -- khong xay ra vi 2 pass da dung scurve_reach */
     }
 
     p.v_start = v_start;
-    p.v_m     = v_dat;
+    p.v_m     = v_feasible;
     p.v_end   = v_end;
 
     /* eq (1)/(2): vung tang toc ; eq (4)/(5): vung giam toc */
@@ -337,30 +337,30 @@ struct SCurveProfile compute_scurve(float L, float feedrate,
     p.T4 = (p.v_m > 1e-6f) ? L_cru / p.v_m : 0.0f;
 
     /* bang bien: eq (17) tinh tai CUOI tung vung (u = T_vung).
-       v_bien: van toc cuoi vung; s_bien: quang duong tich luy. */
-    p.t_bien[0] = 0.0f;  p.v_bien[0] = v_start;  p.s_bien[0] = 0.0f;
+       v_bound: van toc cuoi vung; s_bound: quang duong tich luy. */
+    p.t_bound[0] = 0.0f;  p.v_bound[0] = v_start;  p.s_bound[0] = 0.0f;
     {
         float T[8] = { 0.0f, p.T1, p.T2, p.T3, p.T4, p.T5, p.T6, p.T7 };
         int r;
-        for (r = 1; r <= 7; r++) p.t_bien[r] = p.t_bien[r-1] + T[r];
+        for (r = 1; r <= 7; r++) p.t_bound[r] = p.t_bound[r-1] + T[r];
     }
-    p.v_bien[1] = v_start + 0.5f * J * p.T1 * p.T1;        /* cuoi vung 1 */
-    p.v_bien[2] = p.v_bien[1] + p.A * p.T2;                /* cuoi vung 2 */
-    p.v_bien[3] = p.v_m;                                   /* cuoi vung 3 */
-    p.v_bien[4] = p.v_m;                                   /* cuoi vung 4 */
-    p.v_bien[5] = p.v_m - 0.5f * J * p.T5 * p.T5;          /* cuoi vung 5 */
-    p.v_bien[6] = p.v_bien[5] - p.D * p.T6;                /* cuoi vung 6 */
-    p.v_bien[7] = v_end;                                   /* cuoi vung 7 */
+    p.v_bound[1] = v_start + 0.5f * J * p.T1 * p.T1;        /* cuoi vung 1 */
+    p.v_bound[2] = p.v_bound[1] + p.A * p.T2;                /* cuoi vung 2 */
+    p.v_bound[3] = p.v_m;                                   /* cuoi vung 3 */
+    p.v_bound[4] = p.v_m;                                   /* cuoi vung 4 */
+    p.v_bound[5] = p.v_m - 0.5f * J * p.T5 * p.T5;          /* cuoi vung 5 */
+    p.v_bound[6] = p.v_bound[5] - p.D * p.T6;                /* cuoi vung 6 */
+    p.v_bound[7] = v_end;                                   /* cuoi vung 7 */
 
-    p.s_bien[1] = v_start * p.T1 + J * p.T1*p.T1*p.T1 / 6.0f;
-    p.s_bien[2] = p.s_bien[1] + p.v_bien[1] * p.T2 + 0.5f * p.A * p.T2*p.T2;
-    p.s_bien[3] = p.s_bien[2] + p.v_m * p.T3 - J * p.T3*p.T3*p.T3 / 6.0f;
-    p.s_bien[4] = p.s_bien[3] + p.v_m * p.T4;
-    p.s_bien[5] = p.s_bien[4] + p.v_m * p.T5 - J * p.T5*p.T5*p.T5 / 6.0f;
-    p.s_bien[6] = p.s_bien[5] + p.v_bien[5] * p.T6 - 0.5f * p.D * p.T6*p.T6;
-    p.s_bien[7] = p.s_bien[6] + v_end * p.T7 + J * p.T7*p.T7*p.T7 / 6.0f;
+    p.s_bound[1] = v_start * p.T1 + J * p.T1*p.T1*p.T1 / 6.0f;
+    p.s_bound[2] = p.s_bound[1] + p.v_bound[1] * p.T2 + 0.5f * p.A * p.T2*p.T2;
+    p.s_bound[3] = p.s_bound[2] + p.v_m * p.T3 - J * p.T3*p.T3*p.T3 / 6.0f;
+    p.s_bound[4] = p.s_bound[3] + p.v_m * p.T4;
+    p.s_bound[5] = p.s_bound[4] + p.v_m * p.T5 - J * p.T5*p.T5*p.T5 / 6.0f;
+    p.s_bound[6] = p.s_bound[5] + p.v_bound[5] * p.T6 - 0.5f * p.D * p.T6*p.T6;
+    p.s_bound[7] = p.s_bound[6] + v_end * p.T7 + J * p.T7*p.T7*p.T7 / 6.0f;
 
-    p.total_time = p.t_bien[7];
+    p.total_time = p.t_bound[7];
     return p;
 }
 
@@ -375,17 +375,17 @@ void scurve_state(float t_sec, const struct SCurveProfile *p,
                   float *out_s, float *out_v) {
     float J = MAX_JERK;
     int r;
-    float u, con_lai;
+    float u, t_remain;
 
     if (t_sec >= p->total_time) {         /* het profil: ghim o diem cuoi */
         *out_v = p->v_end;
-        *out_s = p->s_bien[7];
+        *out_s = p->s_bound[7];
         return;
     }
     /* tim vung r chua t_sec (vung rong T=0 tu dong bi nhay qua) */
     r = 1;
-    while (r < 7 && t_sec > p->t_bien[r]) r++;
-    u = t_sec - p->t_bien[r-1];           /* thoi gian tinh tu DAU vung r */
+    while (r < 7 && t_sec > p->t_bound[r]) r++;
+    u = t_sec - p->t_bound[r-1];           /* thoi gian tinh tu DAU vung r */
 
     switch (r) {
     case 1:  /* eq (17) dong 1 -- jerk +J:   v = v_start + J*u^2/2 */
@@ -393,33 +393,33 @@ void scurve_state(float t_sec, const struct SCurveProfile *p,
         *out_s = p->v_start * u + J * u*u*u / 6.0f;
         break;
     case 2:  /* dong 2 -- gia toc A khong doi */
-        *out_v = p->v_bien[1] + p->A * u;
-        *out_s = p->s_bien[1] + p->v_bien[1] * u + 0.5f * p->A * u*u;
+        *out_v = p->v_bound[1] + p->A * u;
+        *out_s = p->s_bound[1] + p->v_bound[1] * u + 0.5f * p->A * u*u;
         break;
     case 3:  /* dong 3 -- jerk -J; viet theo thoi gian CON LAI den cuoi vung
-                de thay ro v cham tran v_m: v = v_m - J*(con_lai)^2/2 */
-        con_lai = p->T3 - u;
-        *out_v = p->v_m - 0.5f * J * con_lai * con_lai;
-        *out_s = p->s_bien[2] + p->v_m * u
-                 - J * (p->T3*p->T3*p->T3 - con_lai*con_lai*con_lai) / 6.0f;
+                de thay ro v cham tran v_m: v = v_m - J*(t_remain)^2/2 */
+        t_remain = p->T3 - u;
+        *out_v = p->v_m - 0.5f * J * t_remain * t_remain;
+        *out_s = p->s_bound[2] + p->v_m * u
+                 - J * (p->T3*p->T3*p->T3 - t_remain*t_remain*t_remain) / 6.0f;
         break;
     case 4:  /* dong 4 -- di deu o v_m */
         *out_v = p->v_m;
-        *out_s = p->s_bien[3] + p->v_m * u;
+        *out_s = p->s_bound[3] + p->v_m * u;
         break;
     case 5:  /* dong 5 -- jerk -J: bat dau roi khoi v_m */
         *out_v = p->v_m - 0.5f * J * u * u;
-        *out_s = p->s_bien[4] + p->v_m * u - J * u*u*u / 6.0f;
+        *out_s = p->s_bound[4] + p->v_m * u - J * u*u*u / 6.0f;
         break;
     case 6:  /* dong 6 -- gia toc -D khong doi */
-        *out_v = p->v_bien[5] - p->D * u;
-        *out_s = p->s_bien[5] + p->v_bien[5] * u - 0.5f * p->D * u*u;
+        *out_v = p->v_bound[5] - p->D * u;
+        *out_s = p->s_bound[5] + p->v_bound[5] * u - 0.5f * p->D * u*u;
         break;
     default: /* vung 7, dong 7 -- jerk +J: tiep dat em o v_end */
-        con_lai = p->T7 - u;
-        *out_v = p->v_end + 0.5f * J * con_lai * con_lai;
-        *out_s = p->s_bien[6] + p->v_end * u
-                 + J * (p->T7*p->T7*p->T7 - con_lai*con_lai*con_lai) / 6.0f;
+        t_remain = p->T7 - u;
+        *out_v = p->v_end + 0.5f * J * t_remain * t_remain;
+        *out_s = p->s_bound[6] + p->v_end * u
+                 + J * (p->T7*p->T7*p->T7 - t_remain*t_remain*t_remain) / 6.0f;
         break;
     }
 }
@@ -530,16 +530,16 @@ int arc_center_from_r(float x0, float y0, float x1, float y1,
    v = sqrt(v0^2 + 2aL); S-curve KHONG co (ton them quang duong keo jerk)
    nhung zone_dist don dieu theo v nen binary search, can tren chinh la
    cong thuc trapezoid (S-curve luon dat THAP hon no).
-   v_dat / v_truot: nhu trong compute_scurve. */
+   v_feasible / v_too_high: nhu trong compute_scurve. */
 float scurve_reach(float v0, float L) {
-    float v_dat   = v0;
-    float v_truot = sqrtf(v0 * v0 + 2.0f * MAX_ACCELERATION * L);
+    float v_feasible   = v0;
+    float v_too_high = sqrtf(v0 * v0 + 2.0f * MAX_ACCELERATION * L);
     int k;
     for (k = 0; k < 48; k++) {
-        float v_thu = 0.5f * (v_dat + v_truot);
-        if (zone_dist(v0, v_thu) <= L) v_dat = v_thu; else v_truot = v_thu;
+        float v_try = 0.5f * (v_feasible + v_too_high);
+        if (zone_dist(v0, v_try) <= L) v_feasible = v_try; else v_too_high = v_try;
     }
-    return v_dat;
+    return v_feasible;
 }
 float junction_velocity(float t0x, float t0y, float t1x, float t1y) {
     /* goc giua 2 tiep tuyen: cos(alpha) = t0 . t1 (2 vector don vi) */

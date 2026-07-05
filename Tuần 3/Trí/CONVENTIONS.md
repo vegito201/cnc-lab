@@ -23,8 +23,10 @@
   — như Figure 1 của Chen 2013) và comment phải GHI SỐ CÔNG THỨC: `eq (1)`, `eq (8)`,
   `eq (17)`... để dò ngược về bài báo được. Khác paper chỗ nào (vd tick → thời gian
   liên tục) thì khai ngay đầu section.
-- Biến binary search không đặt lo/hi — đặt theo nghĩa: `v_dat` (đã biết chắc đạt),
-  `v_truot` (đã biết chắc vượt), `v_thu` (đang thử).
+- **Identifier (tên biến/hàm/struct) bằng TIẾNG ANH, comment bằng tiếng Việt.**
+  Ngoại lệ duy nhất: ký hiệu lấy từ paper (T1..T7, v_m, A, D, J...) giữ nguyên.
+- Biến binary search không đặt lo/hi — đặt theo nghĩa: `v_feasible` (đã biết chắc đạt),
+  `v_too_high` (đã biết chắc vượt), `v_try` (đang thử).
 
 - Hằng số ALLCAPS, tên đầy đủ dễ đọc: MAX_ACCELERATION (không phải ACCEL_MM_S2).
 - Biến/field mang nghĩa vật lý + đơn vị ghi trong comment: v_entry, v_peak, v_exit
