@@ -169,258 +169,102 @@ int read_gcode_file(const char *filepath, struct GCommand *commands, int max_cmd
 }
 
 /* =============================================================
-   S-CURVE PROFILE (7 vung -- Chen 2013 Section 2.1, Figure 1)
+   TRAPEZOID PROFILE
    =============================================================
 
-   KY HIEU DAT THEO PAPER de doc code doi chieu truc tiep voi bai bao:
-     v_start, v_m, v_end : van toc diem dau / mong muon / diem cuoi (Figure 1)
-     T1..T7              : thoi gian 7 vung
-     A, D                : gia toc dinh vung tang / vung giam (o day D = A)
-     J                   : jerk toi da (paper co J1, J2 rieng; o day J1 = J2 = J)
-     L                   : chieu dai doan duong
+   Chia moi doan duong thanh 3 pha van toc:
 
-   KHAC PAPER O 1 DIEM: paper chay theo TICK nguyen (T1 = na*Ts, T2 = k*na*Ts,
-   eq (2),(5),(9),(10) tinh na, nb, nc; eq (11)-(25) chinh v_m', v_start',
-   v_end', J' de khu sai so lam tron tick). Minh mo phong thoi gian LIEN TUC
-   (float) nen na*Ts -> T1 truc tiep va toan bo cum lam tron do khong can.
+       v (mm/s)
+       |           ___________
+   v_peak         /           \
+       |         /             \
+   v_entry _____/               \_____ v_exit
+       |
+       +-------|-----------|-------|---> t (s)
+         t_accel   t_cruise   t_decel
 
-       v (mm/s)                 ______________
-   v_m                        /:              :\
-       |                    /  :              :  \
-       |                  /    :              :    \
-   v_start _____________/      :              :      \______ v_end
-       |    T1   T2   T3       :      T4      : T5  T6  T7
-       +---------------------------------------------------> t
-       a |   /```\             :              :
-       A |  /     \            :              :
-       0 |_/       \___________:______________:_____________
-         |                     :              :\        /
-      -D |                     :              :  \____/
+   Khi doan du dai: v_peak = feedrate (hinh thang day du).
+   Khi doan ngan, khong kip tang den feedrate: profil thanh tam giac,
+   dinh tam giac tinh tu phuong trinh dong hoc v^2 = v0^2 + 2as:
+     - quang duong tang toc: s_acc = (v_peak^2 - v_entry^2) / 2a
+     - quang duong giam toc: s_dec = (v_peak^2 - v_exit^2)  / 2a
+     - tong s_acc + s_dec = do dai doan s, giai ra:
+         v_peak = sqrt(a*s + (v_entry^2 + v_exit^2)/2)
 
-   Vung 1: jerk +J (a: 0->A)       Vung 5: jerk -J (a: 0->-D)
-   Vung 2: a = A khong doi         Vung 6: a = -D khong doi
-   Vung 3: jerk -J (a: A->0)       Vung 7: jerk +J (a: -D->0)
-   Vung 4: di deu o v_m            (T1 = T3, T5 = T7: keo len bao lau
-                                    thi ha xuong bay lau)
+   Vi du: doan 50mm, F3000 (=50mm/s), v_entry = v_exit = 0:
+     v_peak kha thi = sqrt(500*50) = 158 > 50 -> chay o 50 mm/s
+     t_accel = 50/500 = 0.1s, s_accel = 2.5mm
+     s_cruise = 50 - 2.5 - 2.5 = 45mm -> t_cruise = 0.9s
+     tong = 0.1 + 0.9 + 0.1 = 1.1s
 */
-
-/*
- * solve_zone: giai eq (1) [vung tang toc] / eq (4) [vung giam toc]
- * dang lien tuc. Cho do bien thien van toc dv cua ca vung, tra ve
- * T_jerk (= T1 = T3, hoac T5 = T7), T_const (= T2 hoac T6) va
- * gia toc dinh A (hoac D).
- *
- * eq (1) paper viet theo tick:  v_m = v_start + (1+k)*J1*(na*Ts)^2
- * Thay T1 = na*Ts, T2 = k*T1 thi eq (1) chinh la:
- *     dv = J*T1^2 + J*T1*T2 = J*T1*(T1 + T2)                    (*)
- * (J*T1 = gia toc dinh A; dv = dien tich hinh thang gia toc = A*(T1+T2))
- *
- * 2 truong hop -- tuong ung dieu kien na >= A/(J*Ts) cua eq (2):
- *   dv >= A^2/J : gia toc cham tran A -> T1 = A/J, T2 = dv/A - T1 (giai *)
- *   dv <  A^2/J : khong cham tran     -> T2 = 0,   A' = sqrt(J*dv) (giai * voi T2=0)
- *
- * VI DU SO THAT: dv = 50 (0 -> 50 mm/s), A_max = 500, J = 5000:
- *   A^2/J = 500*500/5000 = 50 = dv -> vua cham tran: A = 500
- *   T1 = T3 = 500/5000 = 0.1s ; T2 = 50/500 - 0.1 = 0s
- *   ca vung: 0.2s  (trapezoid cung dv chi can 0.1s -- gia cua jerk huu han)
- */
-void solve_zone(float dv, float *out_T_jerk, float *out_T_const, float *out_A) {
-    float J = MAX_JERK;
-    if (dv <= 1e-6f) {                    /* khong doi van toc: vung rong */
-        *out_T_jerk = 0.0f; *out_T_const = 0.0f; *out_A = 0.0f;
-        return;
-    }
-    float A = sqrtf(J * dv);              /* gia toc dinh neu KHONG cham tran */
-    if (A > MAX_ACCELERATION) A = MAX_ACCELERATION;
-    *out_A       = A;
-    *out_T_jerk  = A / J;                 /* = T1 = T3 (hoac T5 = T7) */
-    *out_T_const = dv / A - *out_T_jerk;  /* = T2 (hoac T6); am -> ep ve 0 */
-    if (*out_T_const < 0.0f) *out_T_const = 0.0f;
-}
-
-/*
- * zone_dist: quang duong di het 1 vung tang/giam toc tu v_low den v_high.
- * Profil gia toc doi xung theo thoi gian nen van toc trung binh cua vung
- * = (v_low + v_high)/2, suy ra:
- *     L_vung = (v_low + v_high)/2 * (T1 + T2 + T3)
- * Day chinh la tung so hang cua eq (8):
- *     2L = (2+k)*((v_start+v_m)*na + (v_end+v_m)*nb)*Ts + 2*v_m*nc*Ts
- * trong do (2+k)*na*Ts = T1+T2+T3 la thoi gian ca vung.
- *
- * VI DU SO THAT (tiep vi du solve_zone): 0 -> 50 mm/s het 0.2s
- *   -> L_vung = (0+50)/2 * 0.2 = 5 mm  (trapezoid: 2.5mm)
- */
-float zone_dist(float v_low, float v_high) {
-    float T_jerk, T_const, A;
-    solve_zone(v_high - v_low, &T_jerk, &T_const, &A);
-    return 0.5f * (v_low + v_high) * (2.0f * T_jerk + T_const);
-}
-
-/* Profil S-curve day du cua 1 doan. Ngoai T1..T7 con luu san "bang bien":
-   thoi diem / van toc / quang duong tai CUOI moi vung, de scurve_state()
-   tra cuu -- cac gia tri nay la eq (17) tinh tai cuoi vung. */
-struct SCurveProfile {
-    float v_start, v_m, v_end;          /* van toc dau / dinh / cuoi (mm/s) */
-    float T1, T2, T3, T4, T5, T6, T7;   /* thoi gian 7 vung (s) */
-    float A, D;                         /* gia toc dinh vung tang / giam (mm/s^2) */
-    float t_bound[8];                    /* t_bound[r] = thoi diem cuoi vung r (t_bound[0]=0) */
-    float v_bound[8];                    /* van toc tai cuoi vung r (mm/s) */
-    float s_bound[8];                    /* quang duong tich luy den cuoi vung r (mm) */
-    float total_time;                   /* = t_bound[7] (s) */
+struct TrapezoidProfile {
+    float v_entry, v_peak, v_exit;      /* van toc vao / dinh / ra (mm/s) */
+    float t_accel, t_cruise, t_decel;   /* thoi gian 3 pha (s) */
+    float total_time;                   /* tong thoi gian doan (s) */
+    float s_accel, s_cruise;            /* quang duong pha 1, pha 2 (mm) */
 };
 
-/*
- * compute_scurve: dung profil 7 vung cho doan dai L, van toc vao/ra cho truoc.
- *
- * Buoc kho nhat la tim v_m. Paper Section 2.2 phan loai duong di thanh
- * 7 Type theo L (eq (26)-(33)) de biet vung nao ton tai, roi chinh v_m'
- * bang eq (11). Minh KHONG phan loai, thay bang nhan xet don dieu:
- *     v_m cang cao -> zone_dist 2 vung cang dai
- * nen binary search v_m lon nhat sao cho:
- *     zone_dist(v_start, v_m) + zone_dist(v_end, v_m) <= L     [dieu kien eq (8)]
- * Type nao thi vung tuong ung tu dong = 0 (Type 2: T4=0; Type 3: T2=T6=T4=0; ...)
- *
- * Ten bien binary search:
- *   v_feasible : gia tri v_m DA BIET CHAC vua trong L (ket qua nam o day)
- *   v_too_high : gia tri v_m DA BIET CHAC doi hoi nhieu hon L
- *   moi vong thu diem giua, thu hep khoang [v_feasible, v_too_high] con mot nua;
- *   48 vong -> sai so ~ v_max/2^48, duoi do phan giai float.
- *
- * VI DU SO THAT: doan 50mm, F3000 (v_max = 50mm/s), v_start = v_end = 0:
- *   thu v_m = 50: zone_dist = 5mm moi ben (vi du o zone_dist) -> 10 <= 50: OK
- *   -> v_m = 50 ; L con lai cho vung 4: 40mm -> T4 = 40/50 = 0.8s
- *   total = 0.2 + 0.8 + 0.2 = 1.2s   (trapezoid cu: 1.1s)
- * Doan ngan khong dat feedrate thi binary search tu ra v_m thap hon.
- */
-struct SCurveProfile compute_scurve(float L, float feedrate,
-                                    float v_start, float v_end) {
-    struct SCurveProfile p;
-    float J = MAX_JERK;
-    float v_max = feedrate / 60.0f;   /* mm/min -> mm/s */
-    int k;
+struct TrapezoidProfile compute_trapezoid(float segment_length, float feedrate,
+                                          float v_entry, float v_exit) {
+    struct TrapezoidProfile prof;
+    float v_max = feedrate / 60.0f;  /* mm/min -> mm/s */
+    float a     = MAX_ACCELERATION;
 
-    /* van toc vao/ra khong duoc vuot feedrate (eq (35) da cap o look-ahead,
-       chan them lan nua cho an toan) */
-    if (v_start > v_max) v_start = v_max;
-    if (v_end   > v_max) v_end   = v_max;
+    /* van toc vao/ra khong duoc vuot feedrate */
+    if (v_entry > v_max) v_entry = v_max;
+    if (v_exit  > v_max) v_exit  = v_max;
 
-    /* tim v_m: binary search dieu kien eq (8) nhu mo ta o tren */
-    float v_feasible   = (v_start > v_end) ? v_start : v_end;
-    float v_too_high = v_max;
-    if (zone_dist(v_start, v_max) + zone_dist(v_end, v_max) <= L) {
-        v_feasible = v_max;   /* doan du dai de dat feedrate (Type 1) */
-    } else {
-        for (k = 0; k < 48; k++) {
-            float v_try = 0.5f * (v_feasible + v_too_high);
-            if (zone_dist(v_start, v_try) + zone_dist(v_end, v_try) <= L)
-                v_feasible = v_try;
-            else
-                v_too_high = v_try;
-        }
-        /* neu ngay ca v_m = max(v_start,v_end) cung khong vua thi look-ahead
-           da sai -- khong xay ra vi 2 pass da dung scurve_reach */
-    }
+    /* v_peak kha thi theo cong thuc o tren; cap boi feedrate */
+    float v_peak = sqrtf(a * segment_length
+                         + (v_entry*v_entry + v_exit*v_exit) / 2.0f);
+    if (v_peak > v_max) v_peak = v_max;
 
-    p.v_start = v_start;
-    p.v_m     = v_feasible;
-    p.v_end   = v_end;
+    prof.v_entry = v_entry;
+    prof.v_peak  = v_peak;
+    prof.v_exit  = v_exit;
+    prof.t_accel = (v_peak - v_entry) / a;               /* tu v = v0 + at */
+    prof.t_decel = (v_peak - v_exit)  / a;
+    prof.s_accel = (v_peak*v_peak - v_entry*v_entry) / (2.0f * a);  /* v^2 = v0^2 + 2as */
 
-    /* eq (1)/(2): vung tang toc ; eq (4)/(5): vung giam toc */
-    solve_zone(p.v_m - v_start, &p.T1, &p.T2, &p.A);  p.T3 = p.T1;
-    solve_zone(p.v_m - v_end,   &p.T5, &p.T6, &p.D);  p.T7 = p.T5;
-
-    /* eq (9)/(10) dang lien tuc: thoi gian vung 4 tu chieu dai con du */
-    float L_acc = 0.5f * (v_start + p.v_m) * (p.T1 + p.T2 + p.T3);
-    float L_dec = 0.5f * (v_end   + p.v_m) * (p.T5 + p.T6 + p.T7);
-    float L_cru = L - L_acc - L_dec;
-    if (L_cru < 0.0f) L_cru = 0.0f;
-    p.T4 = (p.v_m > 1e-6f) ? L_cru / p.v_m : 0.0f;
-
-    /* bang bien: eq (17) tinh tai CUOI tung vung (u = T_vung).
-       v_bound: van toc cuoi vung; s_bound: quang duong tich luy. */
-    p.t_bound[0] = 0.0f;  p.v_bound[0] = v_start;  p.s_bound[0] = 0.0f;
-    {
-        float T[8] = { 0.0f, p.T1, p.T2, p.T3, p.T4, p.T5, p.T6, p.T7 };
-        int r;
-        for (r = 1; r <= 7; r++) p.t_bound[r] = p.t_bound[r-1] + T[r];
-    }
-    p.v_bound[1] = v_start + 0.5f * J * p.T1 * p.T1;        /* cuoi vung 1 */
-    p.v_bound[2] = p.v_bound[1] + p.A * p.T2;                /* cuoi vung 2 */
-    p.v_bound[3] = p.v_m;                                   /* cuoi vung 3 */
-    p.v_bound[4] = p.v_m;                                   /* cuoi vung 4 */
-    p.v_bound[5] = p.v_m - 0.5f * J * p.T5 * p.T5;          /* cuoi vung 5 */
-    p.v_bound[6] = p.v_bound[5] - p.D * p.T6;                /* cuoi vung 6 */
-    p.v_bound[7] = v_end;                                   /* cuoi vung 7 */
-
-    p.s_bound[1] = v_start * p.T1 + J * p.T1*p.T1*p.T1 / 6.0f;
-    p.s_bound[2] = p.s_bound[1] + p.v_bound[1] * p.T2 + 0.5f * p.A * p.T2*p.T2;
-    p.s_bound[3] = p.s_bound[2] + p.v_m * p.T3 - J * p.T3*p.T3*p.T3 / 6.0f;
-    p.s_bound[4] = p.s_bound[3] + p.v_m * p.T4;
-    p.s_bound[5] = p.s_bound[4] + p.v_m * p.T5 - J * p.T5*p.T5*p.T5 / 6.0f;
-    p.s_bound[6] = p.s_bound[5] + p.v_bound[5] * p.T6 - 0.5f * p.D * p.T6*p.T6;
-    p.s_bound[7] = p.s_bound[6] + v_end * p.T7 + J * p.T7*p.T7*p.T7 / 6.0f;
-
-    p.total_time = p.t_bound[7];
-    return p;
+    float s_decel = (v_peak*v_peak - v_exit*v_exit) / (2.0f * a);
+    prof.s_cruise = segment_length - prof.s_accel - s_decel;
+    if (prof.s_cruise < 0.0f) prof.s_cruise = 0.0f;      /* profil tam giac */
+    prof.t_cruise   = (prof.s_cruise > 0.0f) ? prof.s_cruise / v_peak : 0.0f;
+    prof.total_time = prof.t_accel + prof.t_cruise + prof.t_decel;
+    return prof;
 }
 
 /*
- * scurve_state: van toc v va quang duong s tai thoi diem t_sec.
- * Day la eq (17)+(18) cua paper viet o dang LIEN TUC: thay tick n
- * bang thoi gian u tinh tu dau vung (n*Ts -> u), moi nhanh switch
- * la 1 dong cua eq (17). Van analytic -- khong cong don, khong
- * tich luy loi lam tron.
+ * trapezoid_state: vi tri s (mm) va van toc v (mm/s) tai thoi diem t_sec.
+ *
+ * Tinh analytic (truc tiep tu t bang cong thuc dong hoc) thay vi
+ * cong don dv moi 1ms -- cong don se tich luy loi lam tron theo thoi gian,
+ * analytic thi khong.
+ *   Pha 1 tang toc: v = v_entry + a*t,  s = v_entry*t + a*t^2/2
+ *   Pha 2 di deu:   v = v_peak,         s = s_accel + v_peak*t
+ *   Pha 3 giam toc: v = v_peak - a*t,   s = s_accel + s_cruise + v_peak*t - a*t^2/2
+ * (t trong moi pha tinh tu dau pha do)
  */
-void scurve_state(float t_sec, const struct SCurveProfile *p,
-                  float *out_s, float *out_v) {
-    float J = MAX_JERK;
-    int r;
-    float u, t_remain;
+void trapezoid_state(float t_sec, const struct TrapezoidProfile *prof,
+                     float *out_s, float *out_v) {
+    float a = MAX_ACCELERATION;
 
-    if (t_sec >= p->total_time) {         /* het profil: ghim o diem cuoi */
-        *out_v = p->v_end;
-        *out_s = p->s_bound[7];
-        return;
-    }
-    /* tim vung r chua t_sec (vung rong T=0 tu dong bi nhay qua) */
-    r = 1;
-    while (r < 7 && t_sec > p->t_bound[r]) r++;
-    u = t_sec - p->t_bound[r-1];           /* thoi gian tinh tu DAU vung r */
-
-    switch (r) {
-    case 1:  /* eq (17) dong 1 -- jerk +J:   v = v_start + J*u^2/2 */
-        *out_v = p->v_start + 0.5f * J * u * u;
-        *out_s = p->v_start * u + J * u*u*u / 6.0f;
-        break;
-    case 2:  /* dong 2 -- gia toc A khong doi */
-        *out_v = p->v_bound[1] + p->A * u;
-        *out_s = p->s_bound[1] + p->v_bound[1] * u + 0.5f * p->A * u*u;
-        break;
-    case 3:  /* dong 3 -- jerk -J; viet theo thoi gian CON LAI den cuoi vung
-                de thay ro v cham tran v_m: v = v_m - J*(t_remain)^2/2 */
-        t_remain = p->T3 - u;
-        *out_v = p->v_m - 0.5f * J * t_remain * t_remain;
-        *out_s = p->s_bound[2] + p->v_m * u
-                 - J * (p->T3*p->T3*p->T3 - t_remain*t_remain*t_remain) / 6.0f;
-        break;
-    case 4:  /* dong 4 -- di deu o v_m */
-        *out_v = p->v_m;
-        *out_s = p->s_bound[3] + p->v_m * u;
-        break;
-    case 5:  /* dong 5 -- jerk -J: bat dau roi khoi v_m */
-        *out_v = p->v_m - 0.5f * J * u * u;
-        *out_s = p->s_bound[4] + p->v_m * u - J * u*u*u / 6.0f;
-        break;
-    case 6:  /* dong 6 -- gia toc -D khong doi */
-        *out_v = p->v_bound[5] - p->D * u;
-        *out_s = p->s_bound[5] + p->v_bound[5] * u - 0.5f * p->D * u*u;
-        break;
-    default: /* vung 7, dong 7 -- jerk +J: tiep dat em o v_end */
-        t_remain = p->T7 - u;
-        *out_v = p->v_end + 0.5f * J * t_remain * t_remain;
-        *out_s = p->s_bound[6] + p->v_end * u
-                 + J * (p->T7*p->T7*p->T7 - t_remain*t_remain*t_remain) / 6.0f;
-        break;
+    if (t_sec <= prof->t_accel) {
+        /* pha 1: tang toc */
+        *out_v = prof->v_entry + a * t_sec;
+        *out_s = prof->v_entry * t_sec + 0.5f * a * t_sec * t_sec;
+    } else if (t_sec <= prof->t_accel + prof->t_cruise) {
+        /* pha 2: di deu */
+        float t = t_sec - prof->t_accel;
+        *out_v = prof->v_peak;
+        *out_s = prof->s_accel + prof->v_peak * t;
+    } else {
+        /* pha 3: giam toc */
+        float t = t_sec - prof->t_accel - prof->t_cruise;
+        *out_v = prof->v_peak - a * t;
+        if (*out_v < prof->v_exit) *out_v = prof->v_exit;  /* khong tut duoi v_exit */
+        *out_s = prof->s_accel + prof->s_cruise
+                 + prof->v_peak * t - 0.5f * a * t * t;
     }
 }
 
@@ -514,33 +358,13 @@ int arc_center_from_r(float x0, float y0, float x1, float y1,
        tuyet doi. Muon nhanh hon co the noi T len, goc se bi bo tron.)
 
    2. Backward pass (cuoi -> dau): doan i phai GIAM kip tu v[i] xuong
-      v[i+1] trong do dai L[i]. Neu v[i] cao qua thi ha xuong muc voi toi.
+      v[i+1] trong do dai L[i]. Neu v[i] cao qua thi ha xuong
+        v[i] <= sqrt(v[i+1]^2 + 2*a*L[i])
    3. Forward pass (dau -> cuoi): doan i phai TANG kip, doi xung voi (2).
 
-  voi trapezoid la cong thuc dong sqrt(v0^2 + 2*a*L).
-   Voi S-curve thi doi van toc CAN NHIEU QUANG DUONG HON (mat them
-   thoi gian keo gia toc len/xuong) va khong co cong thuc dong --
-   scurve_reach() binary search tren zone_dist() (don dieu).
-   Sau 2 pass, moi cap (v[i], v[i+1]) deu vua trong L[i]
-   nen compute_scurve luon dung duoc profil hop le.
+   Sau 2 pass, moi cap (v[i], v[i+1]) thoa |v[i+1]^2 - v[i]^2| <= 2*a*L[i]
+   nen compute_trapezoid luon dung duoc profil hop le.
 */
-
-/* Van toc cao nhat dat duoc tu v0 sau quang duong L (S-curve; doi xung
-   nen dung duoc cho ca chieu tang lan giam). Trapezoid co cong thuc dong
-   v = sqrt(v0^2 + 2aL); S-curve KHONG co (ton them quang duong keo jerk)
-   nhung zone_dist don dieu theo v nen binary search, can tren chinh la
-   cong thuc trapezoid (S-curve luon dat THAP hon no).
-   v_feasible / v_too_high: nhu trong compute_scurve. */
-float scurve_reach(float v0, float L) {
-    float v_feasible   = v0;
-    float v_too_high = sqrtf(v0 * v0 + 2.0f * MAX_ACCELERATION * L);
-    int k;
-    for (k = 0; k < 48; k++) {
-        float v_try = 0.5f * (v_feasible + v_too_high);
-        if (zone_dist(v0, v_try) <= L) v_feasible = v_try; else v_too_high = v_try;
-    }
-    return v_feasible;
-}
 float junction_velocity(float t0x, float t0y, float t1x, float t1y) {
     /* goc giua 2 tiep tuyen: cos(alpha) = t0 . t1 (2 vector don vi) */
     float dot = t0x*t1x + t0y*t1y;
@@ -555,6 +379,7 @@ void compute_lookahead(struct Segment *segs, int n) {
     /* vj[i] = van toc tai diem noi TRUOC doan i.
        vj[0] = 0 (xuat phat dung yen), vj[n] = 0 (ket thuc dung yen). */
     float vj[MAX_SEGMENTS + 1];
+    float a = MAX_ACCELERATION;
     int i;
 
     /* buoc 1: junction velocity tu goc doi huong, cap boi feedrate 2 doan ke */
@@ -570,14 +395,14 @@ void compute_lookahead(struct Segment *segs, int n) {
         vj[i] = v;
     }
 
-    /* buoc 2: backward pass -- dam bao giam toc kip (S-curve) */
+    /* buoc 2: backward pass -- dam bao giam toc kip */
     for (i = n - 1; i >= 0; i--) {
-        float v_reachable = scurve_reach(vj[i+1], segs[i].length);
+        float v_reachable = sqrtf(vj[i+1]*vj[i+1] + 2.0f * a * segs[i].length);
         if (vj[i] > v_reachable) vj[i] = v_reachable;
     }
-    /* buoc 3: forward pass -- dam bao tang toc kip (S-curve) */
+    /* buoc 3: forward pass -- dam bao tang toc kip */
     for (i = 0; i < n; i++) {
-        float v_reachable = scurve_reach(vj[i], segs[i].length);
+        float v_reachable = sqrtf(vj[i]*vj[i] + 2.0f * a * segs[i].length);
         if (vj[i+1] > v_reachable) vj[i+1] = v_reachable;
     }
 
@@ -776,9 +601,9 @@ int apply_corner_rounding(struct Segment *segs, int n) {
    =============================================================
 
    Noi suy 1 doan (thang hoac cung) theo thoi gian:
-   1. Tinh profil S-curve cho do dai doan
+   1. Tinh profil hinh thang cho do dai doan
    2. Vong lap moi 1ms:
-        a. s(t), v(t) tu profil (scurve_state)
+        a. s(t), v(t) tu profil (trapezoid_state)
         b. alpha = s / L  = phan tram quang duong da di (0..1)
         c. doi alpha thanh toa do:
              thang: P = P0 + alpha*(P1-P0)
@@ -798,14 +623,14 @@ float interpolate_segment(const struct Segment *seg, float t_start_ms, FILE *csv
                   seg->clockwise, &angle_start, &sweep);
     }
 
-    struct SCurveProfile prof = compute_scurve(seg->length, seg->feedrate,
-                                               seg->v_entry, seg->v_exit);
+    struct TrapezoidProfile prof = compute_trapezoid(seg->length, seg->feedrate,
+                                                     seg->v_entry, seg->v_exit);
     float total_ms = prof.total_time * 1000.0f;
 
     float t_ms;
     for (t_ms = 0.0f; t_ms < total_ms; t_ms += DT_MS) {
         float s, v, x, y;
-        scurve_state(t_ms / 1000.0f, &prof, &s, &v);
+        trapezoid_state(t_ms / 1000.0f, &prof, &s, &v);
 
         float alpha = s / seg->length;
         if (alpha > 1.0f) alpha = 1.0f;
@@ -823,10 +648,10 @@ float interpolate_segment(const struct Segment *seg, float t_start_ms, FILE *csv
 
     /* diem cuoi chinh xac */
     if (csv) fprintf(csv, "%.1f,%.4f,%.4f,%.3f\n",
-                     t_start_ms + total_ms, seg->x1, seg->y1, prof.v_end);
+                     t_start_ms + total_ms, seg->x1, seg->y1, prof.v_exit);
 
-    printf("  v_start=%.1f  v_m=%.1f  v_end=%.1f mm/s  |  %.0f ms\n",
-           prof.v_start, prof.v_m, prof.v_end, total_ms);
+    printf("  v_entry=%.1f  v_peak=%.1f  v_exit=%.1f mm/s  |  %.0f ms\n",
+           prof.v_entry, prof.v_peak, prof.v_exit, total_ms);
     return total_ms;
 }
 
