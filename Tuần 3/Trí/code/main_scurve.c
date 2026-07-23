@@ -50,7 +50,7 @@ int main(int argc, char *argv[])
         for (mtick = 0; mtick < p->N; mtick++) {
             float v = scurve_v_tick(mtick, p->vs, p->vmp, p->ve,
                                     p->na, p->nb, p->nc, p->k,
-                                    p->J1p, p->J2p, 0);
+                                    p->J1p, p->J2p);
             s += v * TS;
             float alpha = s / sg->length;  if (alpha > 1.0f) alpha = 1.0f;
             float x, y;

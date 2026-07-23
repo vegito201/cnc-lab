@@ -355,18 +355,49 @@ static float plan_dist(const struct SegPlan *p)
    de hap thu -> v_m' va ve' DI CUNG NHAU (eq (11) voi nb = 0, nc lam
    tron LEN de v_m' <= v_m); moi noi phia sau nhan ve' -- day chinh la
    tinh than Algorithm B ("adjusting the end point feedrate"). */
-static void plan_xuoi_paper(struct Segment *sg, struct SegPlan *p)
+/* =====================================================================
+   plan_C_doan -- dong so MOI doan bang 2.1.2 (phep cua Algorithm C):
+   hai dau lay tu look-ahead (Step 1-2, da <= tran eq34, chi-duoc-HA),
+   KHONG NANG; phan du lam tron nc do DINH + JERK cua chinh doan nuot
+   (eq 9 tron LEN + eq 11-13). Can cu: dinh nghia Algorithm A/B/C trong
+   3.1 khong trich 2.1.3/2.1.4 (Tri phat hien); Table 2 cua paper khong
+   co dau vet nang (khop gat = dung tran eq34).
+   2.1.3/2.1.4 chi con vai du phong chieu-HA khi 2.1.2 bo tay
+   (nc am / dinh tut / jerk no): ket-o-dinh roi cruise. */
+static void plan_C_doan(struct Segment *sg, struct SegPlan *p)
 {
     float vm = sg->feedrate/60.0f, vs = sg->v_entry, ve = sg->v_exit;
-    vm = scurve_peak(vs, ve, vm, sg->length);   /* doan ngan: dinh < v_m (Type 2/3/5/6) */
     float L = sg->length;
+    vm = scurve_peak(vs, ve, vm, L);            /* Type 2/3/5/6: dinh kha thi */
     scurve_steps(vs, vm, ve, &p->na, &p->nb, &p->k);
-    if (p->nb == 0) {
-        /* thu 2 phia lam tron nc, chon vmp cao nhat van <= v_m:
-           it mat toc nhat -> buoc van toc tai khop nho nhat */
+
+    int hong = 0;
+    if (p->nb > 0) {                            /* co vung phanh that: 2.1.2 day du */
+        p->nc = scurve_nc(L, vs, vm, ve, p->na, p->nb, p->k);   /* eq (9) tron LEN */
+        if (p->nc < 0) hong = 1;
+        if (!hong) {
+            p->vmp = scurve_vm_fix(L, vs, ve, p->na, p->nb, p->nc, p->k,
+                                   &p->J1p, &p->J2p);           /* eq (11)-(13) */
+            /* van do TRUC TIEP trieu chung (bai hoc P2): dinh lech nhe
+               duoi vs/ve la gon lan tan hop le -- benh that la J' no,
+               da co coi J' rieng bat. */
+            if (p->vmp > vm + 1e-3f)              hong = 1;   /* doi qua kha nang voi toi */
+            if (fabsf(p->J1p) > MAX_JERK*1.001f)  hong = 1;   /* jerk leo no */
+            if (fabsf(p->J2p) > MAX_JERK*1.001f)  hong = 1;   /* jerk phanh no */
+        }
+        if (!hong) {
+            p->vs = vs;  p->ve = ve;            /* HAI DAU GIU NGUYEN - khong nang */
+            if (p->na == 0) p->vs = p->vmp;     /* decel thuan: so ghi so thuc thi */
+        }
+    }
+    if (p->nb == 0 || hong) {
+        /* nb = 0 (khong co vung phanh -> ve thuc = DINH) hoac 2.1.2 bo tay:
+           ket-o-dinh = 2.1.2 dang suy bien (chinh dinh, ve di theo dinh).
+           Chi duoc HA so voi muc tieu. */
+        scurve_steps(vs, vm, ve, &p->na, &p->nb, &p->k);
+        p->nb = 0;
         int   nc0 = (int)((2.0f*L - (2+p->k)*p->na*(vs+vm)*TS) / (2.0f*vm*TS));
-        float tot = -1.0f;  int nc_tot = nc0 + 1;
-        int thu;
+        float tot = -1.0f;  int nc_tot = nc0 + 1;  int thu;
         for (thu = nc0; thu <= nc0 + 1; thu++) {
             if (thu < 0) continue;
             float v = (2.0f*L - (2+p->k)*p->na*vs*TS) / ((2.0f*thu + (2+p->k)*p->na)*TS);
@@ -374,157 +405,39 @@ static void plan_xuoi_paper(struct Segment *sg, struct SegPlan *p)
         }
         p->nc  = nc_tot;
         p->vmp = (2.0f*L - (2+p->k)*p->na*vs*TS) / ((2.0f*p->nc + (2+p->k)*p->na)*TS);
-        if (p->na > 0 && p->vmp < vs) {
-            /* day chuyen keo dinh xuong DUOI vs -> vung tang thanh "ma"
-               bi ep tut nguoc (J1' no kieu -35263). Sup vung ve 0 tick,
-               chap nhan BUOC van toc tai khop <= v_m/nc ~ 0.13 mm/s --
-               nam trong ngan sach doi toc tai moi noi cua chinh eq (34)
-               (= A*Ts = 0.5 mm/s). */
+        if (p->na > 0 && p->vmp < vs) {         /* van cruise: buoc noi nho nhat */
             p->na = 0;  p->k = 0;
-            /* cruise-ize: nc quyet dinh van toc phang = L/(nc*Ts);
-               thu 2 ung vien, lay cai SAT van toc vao nhat (buoc noi nho) */
             int   nc1 = (int)(L / (vm*TS)) + 1;
             float v1 = L / (nc1*TS), v2 = L / ((nc1+1)*TS);
             if (fabsf(v2 - vs) < fabsf(v1 - vs)) { p->nc = nc1+1; p->vmp = v2; }
             else                                 { p->nc = nc1;   p->vmp = v1; }
         }
+        p->vs  = vs;
         p->ve  = p->vmp;
         p->J2p = 0.0f;
-    } else {
-        p->nc  = scurve_nc_ab(L, vs, vm, ve, p->na, p->nb, p->k);
-        p->vmp = vm;                                     /* B giu v_m (eq 25) */
-        p->ve  = scurve_vend_fix(L, vs, vm, p->na, p->nb, p->k, p->nc, &p->J2p);
-        if (p->ve > vm + 1e-3f || p->ve < ve - 1e-3f || fabsf(p->J2p) > MAX_JERK) {
-            /* vung giam qua nho, khong du suc chua sai so (kieu J2'=-400707):
-               sup ve 0 tick, cho van toc ra "di cung dinh" -- ha nhe van toc
-               khop, luon an toan voi reach cua look-ahead */
-            p->nb  = 0;
-            p->nc  = (int)((2.0f*L - (2+p->k)*p->na*(vs+vm)*TS) / (2.0f*vm*TS)) + 1;
-            p->vmp = (2.0f*L - (2+p->k)*p->na*vs*TS) / ((2.0f*p->nc + (2+p->k)*p->na)*TS);
-            if (p->na > 0 && p->vmp < vs) {
-                p->na = 0;  p->k = 0;
-                p->nc  = (int)(L / (vm*TS)) + 1;
-                p->vmp = L / (p->nc * TS);
-            }
-            p->ve  = p->vmp;
-            p->J2p = 0.0f;
-        }
+        p->J1p = (p->na > 0) ? (p->vmp - vs)/((1+p->k)*(float)p->na*p->na*TS*TS) : 0.0f;
     }
-    p->vs  = vs;
-    p->J1p = (p->na > 0) ? (p->vmp - vs)/((1+p->k)*(float)p->na*p->na*TS*TS) : 0.0f;
-    if (p->nc < 0) p->nc = 0;                    /* an toan: khong co vung deu am */
-    p->N   = (2+p->k)*(p->na + p->nb) + p->nc;
+    if (p->na == 0 && p->nb == 0) {             /* cruise: so sach = so thuc thi */
+        p->vs = p->vmp;  p->ve = p->vmp;
+    }
+    if (p->nc < 0) p->nc = 0;
+    p->N = (2+p->k)*(p->na + p->nb) + p->nc;
     sg->v_exit = p->ve;
-}
-
-/* Quet NGUOC (Algorithm A): ve da chot, don sai so ve phia vao. Doi xung. */
-static void plan_nguoc_paper(struct Segment *sg, struct SegPlan *p)
-{
-    float vm = sg->feedrate/60.0f, vs = sg->v_entry, ve = sg->v_exit;
-    vm = scurve_peak(vs, ve, vm, sg->length);   /* doan ngan: dinh < v_m (Type 2/3/5/6) */
-    float L = sg->length;
-    scurve_steps(vs, vm, ve, &p->na, &p->nb, &p->k);
-    if (p->na == 0) {
-        int   nc0 = (int)((2.0f*L - (2+p->k)*p->nb*(ve+vm)*TS) / (2.0f*vm*TS));
-        float tot = -1.0f;  int nc_tot = nc0 + 1;
-        int thu;
-        for (thu = nc0; thu <= nc0 + 1; thu++) {
-            if (thu < 0) continue;
-            float v = (2.0f*L - (2+p->k)*p->nb*ve*TS) / ((2.0f*thu + (2+p->k)*p->nb)*TS);
-            if (v <= vm + 1e-4f && v > tot) { tot = v; nc_tot = thu; }
-        }
-        p->nc  = nc_tot;
-        p->vmp = (2.0f*L - (2+p->k)*p->nb*ve*TS) / ((2.0f*p->nc + (2+p->k)*p->nb)*TS);
-        if (p->nb > 0 && p->vmp < ve) {
-            /* guong cua plan_xuoi: sup vung giam "ma" ve 0 tick (eq 34) */
-            p->nb = 0;  p->k = 0;
-            int   nc1 = (int)(L / (vm*TS)) + 1;
-            float v1 = L / (nc1*TS), v2 = L / ((nc1+1)*TS);
-            if (fabsf(v2 - ve) < fabsf(v1 - ve)) { p->nc = nc1+1; p->vmp = v2; }
-            else                                 { p->nc = nc1;   p->vmp = v1; }
-        }
-        p->vs  = p->vmp;
-        p->J1p = 0.0f;
-    } else {
-        p->nc  = scurve_nc_ab(L, vs, vm, ve, p->na, p->nb, p->k);
-        p->vmp = vm;                                     /* A giu v_m (eq 22) */
-        p->vs  = scurve_vstart_fix(L, vm, ve, p->na, p->nb, p->k, p->nc, &p->J1p);
-        if (p->vs > vm + 1e-3f || p->vs < vs - 1e-3f || fabsf(p->J1p) > MAX_JERK) {
-            /* guong: vung tang qua nho -> sup ve 0 tick, vao "di cung dinh" */
-            p->na  = 0;
-            p->nc  = (int)((2.0f*L - (2+p->k)*p->nb*(ve+vm)*TS) / (2.0f*vm*TS)) + 1;
-            p->vmp = (2.0f*L - (2+p->k)*p->nb*ve*TS) / ((2.0f*p->nc + (2+p->k)*p->nb)*TS);
-            if (p->nb > 0 && p->vmp < ve) {
-                p->nb = 0;  p->k = 0;
-                p->nc  = (int)(L / (vm*TS)) + 1;
-                p->vmp = L / (p->nc * TS);
-            }
-            p->vs  = p->vmp;
-            p->J1p = 0.0f;
-        }
-    }
-    p->ve  = ve;
-    p->J2p = (p->nb > 0) ? (p->vmp - ve)/((1+p->k)*(float)p->nb*p->nb*TS*TS) : 0.0f;
-    if (p->nc < 0) p->nc = 0;
-    p->N   = (2+p->k)*(p->na + p->nb) + p->nc;
-    sg->v_entry = p->vs;
-}
-
-/* Perfect path (Algorithm C): 2 dau da chot boi 2 luot quet -> eq (9)+(11). */
-
-static void plan_perfect(struct Segment *sg, struct SegPlan *p)
-{
-    float vm = sg->feedrate/60.0f, vs = sg->v_entry, ve = sg->v_exit;
-    vm = scurve_peak(vs, ve, vm, sg->length);   /* doan ngan: dinh < v_m (Type 2/3/5/6) */
-    scurve_steps(vs, vm, ve, &p->na, &p->nb, &p->k);
-    p->nc  = scurve_nc(sg->length, vs, vm, ve, p->na, p->nb, p->k);
-    p->vmp = scurve_vm_fix(sg->length, vs, ve, p->na, p->nb, p->nc, p->k,
-                           &p->J1p, &p->J2p);
-    p->vs = vs;  p->ve = ve;
-    if (p->nc < 0) p->nc = 0;
-    p->N  = (2+p->k)*(p->na + p->nb) + p->nc;
 }
 
 float scurve_plan_all(struct Segment *segs, int n,
                       const struct Block *blocks, int nblocks,
                       struct SegPlan *plans)
 {
-    int i, b;
-    char da_plan[MAX_SEGMENTS] = {0};
-
-    for (b = 0; b < nblocks; b++) {
-        int r = blocks[b].perfect;
-        if (r < 0) r = blocks[b].cuoi;               /* khong co perfect: don het ve cuoi */
-        for (i = blocks[b].dau; i < r; i++) {        /* xuoi bang B toi truoc perfect */
-            plan_xuoi_paper(&segs[i], &plans[i]);
-            segs[i+1].v_entry = plans[i].ve;
-            da_plan[i] = 1;
-        }
-        for (i = blocks[b].cuoi; i > r; i--) {       /* nguoc bang A ve sau perfect */
-            plan_nguoc_paper(&segs[i], &plans[i]);
-            segs[i-1].v_exit = plans[i].vs;
-            da_plan[i] = 1;
-        }
-        plan_perfect(&segs[r], &plans[r]);           /* C chot so */
-        da_plan[r] = 1;
-    }
-    for (i = 0; i < n; i++)                          /* doan le (break path...) */
-        if (!da_plan[i]) plan_xuoi_paper(&segs[i], &plans[i]);
-
-    /* CHUONG eq (34): sau moi phep va, khong moi noi nao duoc vuot
-       ngan sach goc cua (Tri phat hien lo hong: eq 22/25 cua paper cho
-       nang v' ma khong kiem lai eq 34). Chi bao dong, khong doi hanh vi. */
-    for (i = 1; i < n; i++) {
-        float tran_goc = junction_velocity(segs[i-1].tan_out_x, segs[i-1].tan_out_y,
-                                           segs[i].tan_in_x,   segs[i].tan_in_y);
-        float v_khop = plans[i].vs;
-        if (v_khop > tran_goc * 1.001f + 1e-3f)
-            printf("  [CANH BAO eq34] khop %d: v=%.3f vuot tran goc %.3f\n",
-                   i + 1, v_khop, tran_goc);
+    int i;
+    (void)blocks; (void)nblocks;   /* block van dung o divide (Type 7 cat, eq 33);
+                                      plan gio la mot luot xuoi 2.1.2 moi doan */
+    for (i = 0; i < n; i++) {
+        plan_C_doan(&segs[i], &plans[i]);
+        if (i + 1 < n) segs[i+1].v_entry = plans[i].ve;
     }
 
-    /* CHUONG eq (34) hau-plan (Tri yeu cau): sau moi phep va, khong khop nao
-       duoc vuot tran goc cua. Binh thuong phai IM LANG tuyet doi. */
+    /* CHUONG eq (34) hau-plan (Tri yeu cau): binh thuong phai IM LANG. */
     for (i = 1; i < n; i++) {
         float tran_goc = junction_velocity(segs[i-1].tan_out_x, segs[i-1].tan_out_y,
                                            segs[i].tan_in_x,   segs[i].tan_in_y);

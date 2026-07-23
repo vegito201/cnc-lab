@@ -57,7 +57,7 @@ float scurve_reach(float v0, float v_cap, float L);/* nguoc eq (8): tim nhi phan
 
 float scurve_v_tick(int n, float v_start, float v_m, float v_end,
                     int na, int nb, int nc, int k,
-                    float J1p, float J2p, int nguyen_van);      /* eq (17)-(18) */
+                    float J1p, float J2p);                      /* eq (17)-(18) */
 
 float scurve_peak(float v_start, float v_end, float v_cap, float L);
                                     /* Type 2/3/5/6: dinh kha thi cua doan ngan */

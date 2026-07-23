@@ -7,7 +7,9 @@
    mat chu deu neo vao can cu trong CHINH paper (chi tiet + bang chung so:
    GHI_CHU_LOI_BAN_IN_PAPER.md):
    [P1] Delta-v = 0 -> vung 0 tick (mat chu [sqrt(0)+1]=1 -> k2=-2 -> NaN)
-   [P2] dieu kien chinh k: kiem truc tiep a' = dv/((1+k)*na*Ts) > A
+   [P2] eq (3)/(6) voi chieu DUNG: na > A/(J1*Ts) = "gia toc cham tran,
+        can them nhip giu" (ban in sai chieu bat dang thuc -> ca dv=0
+        bi xep nham che do; tuong duong voi do truc tiep a' > A)
    [P3] k1 = ceil(J*dv/A^2 - 1): nghiem nho nhat cua eq (1) thoa [P2]
    [P4] k = max(k1,k2): mot k chung phai thoa CA HAI ben (T2=kT1, T6=kT5)
    ===================================================================== */
@@ -18,20 +20,44 @@ void scurve_steps(float v_start, float v_m, float v_end,
     float A  = MAX_ACCELERATION, D = MAX_ACCELERATION;
     float dva = v_m - v_start, dvb = v_m - v_end;
     int   k = 0, na, nb;
+    int   k_truoc = k;               /* "If k is changed": so k moi vs k cu */
 
     na = (dva <= 1e-6f) ? 0                                          /* [P1] */
        : (int)(sqrtf(dva / ((1 + k) * J1 * TS * TS)) + 1.0f);        /* eq (2) */
     nb = (dvb <= 1e-6f) ? 0
        : (int)(sqrtf(dvb / ((1 + k) * J2 * TS * TS)) + 1.0f);        /* eq (5) */
     {
-        int k1 = 0, k2 = 0;
-        if (na > 0 && dva / ((1 + k) * na * TS) > A)                 /* [P2] */
-            k1 = (int)ceilf(J1 * dva / (A * A) - 1.0f);              /* [P3] */
-        if (nb > 0 && dvb / ((1 + k) * nb * TS) > D)
+        /* FLOW MAT CHU (Tri chot 22/07): na >= A/(J1*Ts) -> NHAN na, khong
+           dung toi k; na < nguong -> tinh lai k theo eq (3)/(6).
+           HANG SO -1 (ban in ghi "-2" la loi in -- 3 chung minh, xem
+           GHI_CHU; chung minh thu 3 cua Tri: eq (3) phai dong quy voi
+           eq (1) tai dv=0 -> k -> -1; hang -2 cho dien tich AM).
+           K = MAX cac can duoi vi k DUNG CHUNG 2 ve (eq 10: N2=k*na,
+           N6=k*nb): "k nho nhat con hop le" = max; min cua ban in bo
+           doi ve doi cao -> vuot tran 41% (demo t2.c). */
+        int na_sat = (int)(A / (J1 * TS)), nb_sat = (int)(D / (J2 * TS));
+        int k1 = k, k2 = k;
+        if (na > 0 && na < na_sat)                                   /* eq (3) chieu "<" */
+            k1 = (int)ceilf(J1 * dva / (A * A) - 1.0f);              /* [P3] hang -1 */
+        if (nb > 0 && nb < nb_sat)                                   /* eq (6) chieu "<" */
             k2 = (int)ceilf(J2 * dvb / (D * D) - 1.0f);
-        k = (k1 > k2) ? k1 : k2;                                     /* [P4] */
+        if (k1 < 0) k1 = 0;          /* luoi an toan: voi hang -1 gan nhu khong bao gio kich */
+        if (k2 < 0) k2 = 0;
+        k = (k1 > k2) ? k1 : k2;                                     /* [P4] k = max can duoi */
+
+        /* CHOT AN TOAN ngoai dinh muc (dv > A^2/J = 160000 mm/s): nhanh
+           "<" khong phu ca nay; bo trong thi a' = J*na*Ts vuot tran A.
+           Nhanh chet trong de bai (dv <= 33.33) -- chi song o test tong hop. */
+        if (na > 0 && na > na_sat) {
+            int kk = (int)ceilf(J1 * dva / (A * A) - 1.0f);
+            if (kk > k) k = kk;
+        }
+        if (nb > 0 && nb > nb_sat) {
+            int kk = (int)ceilf(J2 * dvb / (D * D) - 1.0f);
+            if (kk > k) k = kk;
+        }
     }
-    if (k > 0) {
+    if (k != k_truoc) {              /* mat chu: "If k is changed, na and nb are calculated by (7)" */
         if (na > 0) na = (int)(sqrtf(dva / ((1 + k) * J1 * TS * TS)) + 1.0f);
         if (nb > 0) nb = (int)(sqrtf(dvb / ((1 + k) * J2 * TS * TS)) + 1.0f);
     }
@@ -235,13 +261,14 @@ float scurve_peak(float v_start, float v_end, float v_cap, float L)
    Tong so tick 1 doan: N = (2+k)*na + nc + (2+k)*nb.
 
    CANH BAO BAN IN (2 cot bi tron dong): nhanh pha 3, 5, 6 trong PDF
-   doc khong chac chan. Tham so nguyen_van: 1 = go dung mat chu PDF;
-   0 = ban dao ham lai tu [15] (Tri chot dung ban dao ham 2026-07-09;
-   bang chung test_tick: mat chu hut 3.5-4.9mm + giat 99-132 mm/s,
-   dao ham lech 0.00003mm; pha 3 ban in ROI mat "+3na").              */
+   doc khong chac chan -> DUNG BAN DAO HAM LAI tu [15] (Tri chot
+   2026-07-09; bang chung: ban mat chu hut 3.5-4.9mm + giat 99-132
+   mm/s, ban dao ham chi lech 0.00003mm; pha 3 ban in ROI mat "+3na").
+   Ban nguyen van da go khoi code 2026-07-20 sau khi xong nhiem vu
+   doi chung; ho so day du: GHI_CHU_LOI_BAN_IN_PAPER.md.              */
 float scurve_v_tick(int n, float v_start, float v_m, float v_end,
                     int na, int nb, int nc, int k,
-                    float J1p, float J2p, int nguyen_van)
+                    float J1p, float J2p)
 {
     float ptick = TS * TS / 6.0f;                     /* paper: p = Ts^2/6 */
     int n2 = n - na, n3 = n - (k+1)*na, n4 = n - (k+2)*na;
@@ -252,23 +279,15 @@ float scurve_v_tick(int n, float v_start, float v_m, float v_end,
     if (n2 < k*na)                                    /* pha 2: giu ga */
         return v_start + 3.0f*ptick*J1p*na*(2*n2 + na + 1);
     if (n3 < na) {                                    /* pha 3: nha ga */
-        if (nguyen_van)                               /* mat chu PDF */
-            return v_start + ptick*J1p*(3.0f*na*na + 6.0f*k*na*na
-                                        + 6.0f*na*n3 - 3.0f*n3*n3 - 3*n3 - 1);
         return v_start + ptick*J1p*(3.0f*na*na + 6.0f*k*na*na + 3.0f*na
                                     + 6.0f*na*n3 - 3.0f*n3*n3 - 3*n3 - 1);
     }
     if (n4 < nc)                                      /* pha 4: deu */
         return v_m;
     if (n5 < nb) {                                    /* pha 5: dap phanh */
-        if (nguyen_van)
-            return v_end + ptick*J2p*((6.0f+k)*nb*nb
-                       - 3.0f*(n5-(k+2)*na)*(n5-(k+2)*na) - 3*(n5-(k+2)*na) - 1);
         return v_m - ptick*J2p*(3.0f*n5*n5 + 3*n5 + 1);
     }
     if (n6 < k*nb) {                                  /* pha 6: giu phanh */
-        if (nguyen_van)
-            return v_end + 3.0f*ptick*J2p*nb*(na + 2.0f*nb - 2*n6 - 1);
         return v_m - 3.0f*ptick*J2p*nb*(2*n6 + nb + 1);
     }
     /* pha 7: nha phanh -- mat chu PDF khop voi dao ham, dung chung */
